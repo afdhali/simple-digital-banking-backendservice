@@ -1,0 +1,3567 @@
+﻿
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\DigitalBankingApplication.java ===
+package tutorjava.digitalbanking;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@ConfigurationPropertiesScan
+@EnableScheduling
+public class DigitalBankingApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(DigitalBankingApplication.class, args);
+	}
+
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\Account.java ===
+package tutorjava.digitalbanking.account;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import tutorjava.digitalbanking.common.entity.AuditableEntity;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+
+/**
+ * Rich domain object: balance can only change through credit()/debit(), which
+ * enforce the
+ * business invariants (active account, no overdraft). The DB CHECK (balance >=
+ * 0) is the safety net.
+ */
+@Getter
+@Entity
+@Table(name = "accounts")
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class Account extends AuditableEntity {
+
+    @Column(name = "account_number", nullable = false, updatable = false, length = 10)
+    private String accountNumber;
+
+    @Column(name = "user_id", nullable = false, updatable = false)
+    private UUID userId;
+
+    @Column(name = "account_name", nullable = false, length = 50)
+    private String accountName;
+
+    @Column(name = "currency", nullable = false, updatable = false, length = 3)
+    private String currency;
+
+    @Column(name = "balance", nullable = false, precision = 19, scale = 2)
+    private BigDecimal balance;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false, length = 20)
+    private AccountStatus status;
+
+    public static Account open(UUID userId, String accountNumber, String accountName, String currency) {
+        Account account = new Account();
+        account.userId = userId;
+        account.accountNumber = accountNumber;
+        account.accountName = accountName;
+        account.currency = currency;
+        account.balance = BigDecimal.ZERO.setScale(2);
+        account.status = AccountStatus.ACTIVE;
+        return account;
+    }
+
+    public boolean isOwnedBy(UUID candidateUserId) {
+        return userId.equals(candidateUserId);
+    }
+
+    public void credit(BigDecimal amount) {
+        requireActive();
+        balance = balance.add(amount);
+    }
+
+    public void debit(BigDecimal amount) {
+        requireActive();
+        if (balance.compareTo(amount) < 0) {
+            throw new BusinessException(ErrorCode.INSUFFICIENT_BALANCE);
+        }
+        balance = balance.subtract(amount);
+    }
+
+    private void requireActive() {
+        if (status != AccountStatus.ACTIVE) {
+            throw new BusinessException(ErrorCode.ACCOUNT_NOT_ACTIVE);
+        }
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\AccountController.java ===
+package tutorjava.digitalbanking.account;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import tutorjava.digitalbanking.account.dto.AccountResponse;
+import tutorjava.digitalbanking.account.dto.CreateAccountRequest;
+import tutorjava.digitalbanking.common.response.ApiError;
+import tutorjava.digitalbanking.config.OpenApiConfig;
+import tutorjava.digitalbanking.security.AuthenticatedUser;
+
+import java.net.URI;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/v1/accounts")
+@RequiredArgsConstructor
+@Tag(name = "Accounts")
+@SecurityRequirement(name = OpenApiConfig.BEARER_SCHEME)
+public class AccountController {
+
+    private final AccountService accountService;
+
+    @PostMapping
+    @Operation(summary = "Open a new account (starts with zero balance)")
+    @ApiResponse(responseCode = "422", description = "Account limit reached", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public ResponseEntity<AccountResponse> open(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @Valid @RequestBody CreateAccountRequest request) {
+        AccountResponse created = accountService.open(principal.id(), request);
+        return ResponseEntity.created(URI.create("/api/v1/accounts/" + created.accountNumber())).body(created);
+    }
+
+    @GetMapping
+    @Operation(summary = "List my accounts")
+    public List<AccountResponse> list(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal) {
+        return accountService.listOwn(principal.id());
+    }
+
+    @GetMapping("/{accountNumber}")
+    @Operation(summary = "Get one of my accounts (including balance)")
+    @ApiResponse(responseCode = "404", description = "Account not found or not owned by the caller", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public AccountResponse get(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @PathVariable String accountNumber) {
+        return accountService.getOwn(principal.id(), accountNumber);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\AccountLockService.java ===
+package tutorjava.digitalbanking.account;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * Acquires row locks on accounts. Propagation.MANDATORY guarantees this is only
+ * ever called
+ * from inside a transaction (a lock outside a transaction would be released
+ * immediately).
+ */
+@Service
+@RequiredArgsConstructor
+public class AccountLockService {
+
+    private final AccountRepository accountRepository;
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Map<String, Account> lock(Set<String> accountNumbers) {
+        Map<String, Account> locked = new LinkedHashMap<>();
+        accountRepository.findAllForUpdate(accountNumbers).forEach(a -> locked.put(a.getAccountNumber(), a));
+        if (!locked.keySet().containsAll(new HashSet<>(accountNumbers))) {
+            throw new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND);
+        }
+        return locked;
+    }
+
+    /**
+     * Locks one account and verifies it belongs to the user (foreign accounts look
+     * like "not found").
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Account lockOwned(String accountNumber, UUID userId) {
+        Account account = lock(Set.of(accountNumber)).get(accountNumber);
+        if (!account.isOwnedBy(userId)) {
+            throw new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND);
+        }
+        return account;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\AccountNumberGenerator.java ===
+package tutorjava.digitalbanking.account;
+
+import org.springframework.stereotype.Component;
+
+import java.security.SecureRandom;
+
+/** 10-digit, non-sequential (not guessable / enumerable) account numbers. */
+@Component
+public class AccountNumberGenerator {
+
+    private final SecureRandom random = new SecureRandom();
+
+    public String next() {
+        long value = 1_000_000_000L + random.nextLong(9_000_000_000L);
+        return Long.toString(value);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\AccountRepository.java ===
+package tutorjava.digitalbanking.account;
+
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+public interface AccountRepository extends JpaRepository<Account, UUID> {
+
+    List<Account> findByUserIdOrderByCreatedAtDesc(UUID userId);
+
+    Optional<Account> findByAccountNumberAndUserId(String accountNumber, UUID userId);
+
+    boolean existsByAccountNumber(String accountNumber);
+
+    long countByUserId(UUID userId);
+
+    /**
+     * SELECT ... FOR UPDATE. Rows are always locked in the same order
+     * (account_number ASC), so two
+     * concurrent transfers A->B and B->A cannot deadlock. Must run inside a
+     * transaction.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select a from Account a where a.accountNumber in :numbers order by a.accountNumber")
+    List<Account> findAllForUpdate(@Param("numbers") Collection<String> numbers);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\AccountService.java ===
+package tutorjava.digitalbanking.account;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.account.dto.AccountResponse;
+import tutorjava.digitalbanking.account.dto.CreateAccountRequest;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.config.BankingProperties;
+
+import java.util.List;
+import java.util.UUID;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AccountService {
+
+    private static final int MAX_NUMBER_ATTEMPTS = 5;
+
+    private final AccountRepository accountRepository;
+    private final AccountNumberGenerator numberGenerator;
+    private final BankingProperties bankingProperties;
+
+    @Transactional
+    public AccountResponse open(UUID userId, CreateAccountRequest request) {
+        if (accountRepository.countByUserId(userId) >= bankingProperties.maxAccountsPerUser()) {
+            throw new BusinessException(ErrorCode.ACCOUNT_LIMIT_REACHED);
+        }
+        Account account = Account.open(userId, uniqueAccountNumber(), request.accountName().trim(),
+                bankingProperties.currency());
+        accountRepository.save(account);
+        log.atInfo()
+                .addKeyValue("userId", userId)
+                .addKeyValue("accountNumber", account.getAccountNumber())
+                .log("Account opened");
+        return AccountResponse.from(account);
+    }
+
+    @Transactional(readOnly = true)
+    public List<AccountResponse> listOwn(UUID userId) {
+        return accountRepository.findByUserIdOrderByCreatedAtDesc(userId).stream()
+                .map(AccountResponse::from)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public AccountResponse getOwn(UUID userId, String accountNumber) {
+        return accountRepository.findByAccountNumberAndUserId(accountNumber, userId)
+                .map(AccountResponse::from)
+                .orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
+    }
+
+    private String uniqueAccountNumber() {
+        for (int attempt = 0; attempt < MAX_NUMBER_ATTEMPTS; attempt++) {
+            String candidate = numberGenerator.next();
+            if (!accountRepository.existsByAccountNumber(candidate)) {
+                return candidate; // the UNIQUE constraint still guards against a race
+            }
+        }
+        throw new IllegalStateException("Could not generate a unique account number");
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\AccountStatus.java ===
+package tutorjava.digitalbanking.account;
+
+public enum AccountStatus {
+    ACTIVE,
+    FROZEN,
+    CLOSED
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\dto\AccountResponse.java ===
+package tutorjava.digitalbanking.account.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import tutorjava.digitalbanking.account.Account;
+import tutorjava.digitalbanking.account.AccountStatus;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+
+public record AccountResponse(
+        @Schema(example = "1234567890") String accountNumber,
+        @Schema(example = "Tabungan Utama") String accountName,
+        @Schema(example = "IDR") String currency,
+        @Schema(example = "1500000.00") BigDecimal balance,
+        AccountStatus status,
+        Instant createdAt) {
+
+    public static AccountResponse from(Account account) {
+        return new AccountResponse(account.getAccountNumber(), account.getAccountName(),
+                account.getCurrency(), account.getBalance(), account.getStatus(), account.getCreatedAt());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\account\dto\CreateAccountRequest.java ===
+package tutorjava.digitalbanking.account.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record CreateAccountRequest(
+        @Schema(example = "Tabungan Utama") @NotBlank @Size(max = 50) String accountName) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\AuthController.java ===
+package tutorjava.digitalbanking.auth;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseCookie;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+import tutorjava.digitalbanking.auth.dto.AuthResponse;
+import tutorjava.digitalbanking.auth.dto.LoginRequest;
+import tutorjava.digitalbanking.auth.dto.RefreshRequest;
+import tutorjava.digitalbanking.auth.dto.RegisterRequest;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.common.response.ApiError;
+import tutorjava.digitalbanking.config.OpenApiConfig;
+import tutorjava.digitalbanking.security.AuthenticatedUser;
+import tutorjava.digitalbanking.user.dto.UserResponse;
+
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+@Tag(name = "Authentication", description = "Register, login, refresh and logout. Web: refresh token in an HttpOnly cookie. "
+        + "Mobile (header X-Client-Type: mobile): refresh token in the JSON body.")
+public class AuthController {
+
+    private static final String CLIENT_TYPE_HEADER = "X-Client-Type";
+    private static final String CLIENT_TYPE_MOBILE = "mobile";
+
+    private final AuthService authService;
+    private final RefreshTokenCookies cookies;
+
+    @PostMapping("/register")
+    @ResponseStatus(HttpStatus.CREATED)
+    @Operation(summary = "Register a new customer")
+    @ApiResponse(responseCode = "409", description = "Email already registered", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public UserResponse register(@Valid @RequestBody RegisterRequest request) {
+        return authService.register(request);
+    }
+
+    @PostMapping("/login")
+    @Operation(summary = "Login. Returns a short-lived access token and starts a refresh-token session", description = "Web (default): the refresh token is set as an HttpOnly cookie and omitted from the body. "
+            + "Mobile: send `X-Client-Type: mobile` to receive `refreshToken` in the body.")
+    @ApiResponse(responseCode = "401", description = "Invalid credentials", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    @ApiResponse(responseCode = "423", description = "User temporarily locked after repeated failures", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public ResponseEntity<AuthResponse> login(
+            @Valid @RequestBody LoginRequest request,
+            @Parameter(description = "Use 'mobile' to get the refresh token in the response body") @RequestHeader(name = CLIENT_TYPE_HEADER, required = false) String clientType) {
+        boolean bodyDelivery = CLIENT_TYPE_MOBILE.equalsIgnoreCase(clientType);
+        return tokenResponse(authService.login(request), bodyDelivery);
+    }
+
+    @PostMapping("/refresh")
+    @Operation(summary = "Get a new access token (the refresh token is rotated)", description = "Web: call with no body; the browser sends the HttpOnly cookie. "
+            + "Mobile: send `{\"refreshToken\": \"...\"}`. Every refresh token is single-use: "
+            + "replaying an already used token revokes the whole session.")
+    @ApiResponse(responseCode = "401", description = "Refresh token invalid, expired or already used", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    @ApiResponse(responseCode = "403", description = "Cookie request from an untrusted Origin", content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public ResponseEntity<AuthResponse> refresh(@Valid @RequestBody(required = false) RefreshRequest body,
+            HttpServletRequest http) {
+        String fromBody = bodyToken(body);
+        boolean bodyDelivery = fromBody != null;
+        String rawToken;
+        if (bodyDelivery) {
+            rawToken = fromBody;
+        } else {
+            cookies.requireTrustedOrigin(http); // cookie => CSRF defence
+            rawToken = cookies.read(http)
+                    .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_REFRESH_TOKEN));
+        }
+        return tokenResponse(authService.refresh(rawToken), bodyDelivery);
+    }
+
+    @PostMapping("/logout")
+    @Operation(summary = "Logout: revoke the current session (idempotent)", description = "Web: no body, the cookie identifies the session and is cleared. "
+            + "Mobile: send `{\"refreshToken\": \"...\"}`. Always returns 204. "
+            + "The access token already issued stays valid until it expires (max 15 minutes).")
+    @ApiResponse(responseCode = "204", description = "Logged out")
+    public ResponseEntity<Void> logout(@Valid @RequestBody(required = false) RefreshRequest body,
+            HttpServletRequest http) {
+        String fromBody = bodyToken(body);
+        if (fromBody != null) {
+            authService.logout(fromBody);
+            return ResponseEntity.noContent().build();
+        }
+        cookies.requireTrustedOrigin(http);
+        cookies.read(http).ifPresent(authService::logout);
+        return ResponseEntity.noContent().header(HttpHeaders.SET_COOKIE, cookies.clear().toString()).build();
+    }
+
+    @PostMapping("/logout-all")
+    @SecurityRequirement(name = OpenApiConfig.BEARER_SCHEME)
+    @Operation(summary = "Logout from every device (revokes all sessions of the caller)")
+    @ApiResponse(responseCode = "204", description = "All sessions revoked")
+    public ResponseEntity<Void> logoutAll(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal) {
+        authService.logoutEverywhere(principal.id());
+        return ResponseEntity.noContent().header(HttpHeaders.SET_COOKIE, cookies.clear().toString()).build();
+    }
+
+    // ------------------------------------------------------------------ helpers
+    private ResponseEntity<AuthResponse> tokenResponse(AuthResult result, boolean bodyDelivery) {
+        if (bodyDelivery) {
+            return ResponseEntity.ok(AuthResponse.from(result.accessToken(), result.refreshToken().value()));
+        }
+        ResponseCookie cookie = cookies.create(result.refreshToken());
+        return ResponseEntity.ok()
+                .header(HttpHeaders.SET_COOKIE, cookie.toString())
+                .body(AuthResponse.from(result.accessToken(), null));
+    }
+
+    private String bodyToken(RefreshRequest body) {
+        return body != null && body.refreshToken() != null && !body.refreshToken().isBlank()
+                ? body.refreshToken().trim()
+                : null;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\AuthResult.java ===
+package tutorjava.digitalbanking.auth;
+
+import tutorjava.digitalbanking.security.IssuedToken;
+
+/**
+ * What the service layer returns; the controller decides HOW the refresh token
+ * is delivered (cookie/body).
+ */
+public record AuthResult(IssuedToken accessToken, IssuedRefreshToken refreshToken) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\AuthService.java ===
+package tutorjava.digitalbanking.auth;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.auth.dto.LoginRequest;
+import tutorjava.digitalbanking.auth.dto.RegisterRequest;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.config.AuthProperties;
+import tutorjava.digitalbanking.security.JwtService;
+import tutorjava.digitalbanking.user.User;
+import tutorjava.digitalbanking.user.UserRepository;
+import tutorjava.digitalbanking.user.dto.UserResponse;
+
+import java.time.Instant;
+import java.util.Locale;
+import java.util.UUID;
+
+@Slf4j
+@Service
+public class AuthService {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
+    private final RefreshTokenService refreshTokenService;
+    private final AuthProperties authProperties;
+
+    /**
+     * Used to spend the same CPU time when the email is unknown (mitigates user
+     * enumeration by timing).
+     */
+    private final String dummyHash;
+
+    public AuthService(UserRepository userRepository, PasswordEncoder passwordEncoder,
+            JwtService jwtService, RefreshTokenService refreshTokenService,
+            AuthProperties authProperties) {
+        this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.jwtService = jwtService;
+        this.refreshTokenService = refreshTokenService;
+        this.authProperties = authProperties;
+        this.dummyHash = passwordEncoder.encode("timing-attack-mitigation-dummy");
+    }
+
+    @Transactional
+    public UserResponse register(RegisterRequest request) {
+        String email = normalizeEmail(request.email());
+        if (userRepository.existsByEmail(email)) {
+            throw new BusinessException(ErrorCode.EMAIL_ALREADY_REGISTERED);
+        }
+        User user = User.register(email, request.fullName().trim(), passwordEncoder.encode(request.password()));
+        try {
+            // flush now so a concurrent duplicate surfaces here as a clean business error
+            userRepository.saveAndFlush(user);
+        } catch (DataIntegrityViolationException e) {
+            throw new BusinessException(ErrorCode.EMAIL_ALREADY_REGISTERED);
+        }
+        log.atInfo().addKeyValue("userId", user.getId()).log("User registered");
+        return UserResponse.from(user);
+    }
+
+    /**
+     * Intentionally not @Transactional: the failed-attempt counter must be
+     * committed
+     * even though the method ends by throwing an exception.
+     */
+    public AuthResult login(LoginRequest request) {
+        String email = normalizeEmail(request.email());
+        User user = userRepository.findByEmail(email).orElse(null);
+
+        if (user == null) {
+            passwordEncoder.matches(request.password(), dummyHash);
+            log.atWarn().log("Login failed: unknown email");
+            throw new BusinessException(ErrorCode.INVALID_CREDENTIALS);
+        }
+
+        Instant now = Instant.now();
+        if (user.isLocked(now)) {
+            log.atWarn().addKeyValue("userId", user.getId()).log("Login rejected: user temporarily locked");
+            throw new BusinessException(ErrorCode.USER_LOCKED);
+        }
+
+        boolean passwordOk = passwordEncoder.matches(request.password(), user.getPasswordHash());
+        if (!passwordOk || !user.isEnabled()) {
+            user.registerFailedLogin(authProperties.maxFailedLoginAttempts(), authProperties.lockDuration(), now);
+            userRepository.save(user);
+            log.atWarn().addKeyValue("userId", user.getId()).log("Login failed: bad credentials");
+            throw new BusinessException(ErrorCode.INVALID_CREDENTIALS);
+        }
+
+        if (user.hasLoginFailureState()) {
+            user.resetLoginFailures();
+            user = userRepository.save(user);
+        }
+        log.atInfo().addKeyValue("userId", user.getId()).log("Login succeeded");
+        return new AuthResult(jwtService.generateAccessToken(user), refreshTokenService.startSession(user.getId()));
+    }
+
+    /**
+     * Exchanges a valid refresh token for a new access token + a rotated refresh
+     * token.
+     */
+    public AuthResult refresh(String rawRefreshToken) {
+        RefreshTokenService.RotatedSession session = refreshTokenService.rotate(rawRefreshToken);
+        return new AuthResult(jwtService.generateAccessToken(session.user()), session.refreshToken());
+    }
+
+    /**
+     * Ends the session the token belongs to. Never fails for unknown tokens
+     * (idempotent).
+     */
+    public void logout(String rawRefreshToken) {
+        refreshTokenService.revokeSession(rawRefreshToken);
+    }
+
+    public void logoutEverywhere(UUID userId) {
+        refreshTokenService.revokeAllForUser(userId);
+    }
+
+    private String normalizeEmail(String email) {
+        return email.trim().toLowerCase(Locale.ROOT);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\IssuedRefreshToken.java ===
+package tutorjava.digitalbanking.auth;
+
+import java.time.Instant;
+
+/**
+ * The raw value exists only here and in the response; the database holds just
+ * its hash.
+ */
+public record IssuedRefreshToken(String value, Instant expiresAt) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\RefreshToken.java ===
+package tutorjava.digitalbanking.auth;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import tutorjava.digitalbanking.common.entity.BaseEntity;
+
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * Stores only the hash of the token. revoked_at is set through repository bulk
+ * updates (atomic).
+ */
+@Getter
+@Entity
+@Table(name = "refresh_tokens")
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class RefreshToken extends BaseEntity {
+
+    @Column(name = "user_id", nullable = false, updatable = false)
+    private UUID userId;
+
+    @Column(name = "family_id", nullable = false, updatable = false)
+    private UUID familyId;
+
+    @Column(name = "token_hash", nullable = false, updatable = false, length = 64)
+    private String tokenHash;
+
+    @Column(name = "session_started_at", nullable = false, updatable = false)
+    private Instant sessionStartedAt;
+
+    @Column(name = "expires_at", nullable = false, updatable = false)
+    private Instant expiresAt;
+
+    @Column(name = "revoked_at")
+    private Instant revokedAt;
+
+    public static RefreshToken create(UUID userId, UUID familyId, String tokenHash,
+            Instant sessionStartedAt, Instant expiresAt) {
+        RefreshToken token = new RefreshToken();
+        token.userId = userId;
+        token.familyId = familyId;
+        token.tokenHash = tokenHash;
+        token.sessionStartedAt = sessionStartedAt;
+        token.expiresAt = expiresAt;
+        return token;
+    }
+
+    public boolean isExpired(Instant now) {
+        return !expiresAt.isAfter(now);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\RefreshTokenCleanupJob.java ===
+package tutorjava.digitalbanking.auth;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+
+/**
+ * Expired tokens can never be used again, so they (and their revocation
+ * markers) can be deleted.
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class RefreshTokenCleanupJob {
+
+    private final RefreshTokenRepository repository;
+
+    @Scheduled(cron = "0 30 * * * *")
+    @Transactional
+    public void purgeExpired() {
+        int deleted = repository.deleteExpired(Instant.now());
+        log.atInfo().addKeyValue("deleted", deleted).log("Expired refresh tokens purged");
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\RefreshTokenCookies.java ===
+package tutorjava.digitalbanking.auth;
+
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseCookie;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.config.CorsProperties;
+import tutorjava.digitalbanking.config.RefreshTokenProperties;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.Optional;
+
+/**
+ * Browser delivery of the refresh token: HttpOnly (invisible to JavaScript, so
+ * XSS cannot steal it),
+ * Secure, SameSite, and scoped to the auth path so it is not sent with ordinary
+ * API calls.
+ * Because cookies are sent automatically, cookie-based endpoints also verify
+ * the Origin header (CSRF defence).
+ */
+@Component
+@RequiredArgsConstructor
+public class RefreshTokenCookies {
+
+    private final RefreshTokenProperties properties;
+    private final CorsProperties corsProperties;
+
+    public Optional<String> read(HttpServletRequest request) {
+        Cookie[] cookies = request.getCookies();
+        if (cookies == null) {
+            return Optional.empty();
+        }
+        return Arrays.stream(cookies)
+                .filter(c -> properties.cookieName().equals(c.getName()))
+                .map(Cookie::getValue)
+                .filter(v -> v != null && !v.isBlank())
+                .findFirst();
+    }
+
+    public ResponseCookie create(IssuedRefreshToken token) {
+        Duration maxAge = Duration.between(Instant.now(), token.expiresAt());
+        return base(token.value()).maxAge(maxAge.isNegative() ? Duration.ZERO : maxAge).build();
+    }
+
+    public ResponseCookie clear() {
+        return base("").maxAge(Duration.ZERO).build();
+    }
+
+    /**
+     * Browsers always send Origin on cross-origin POSTs. If it is present it must
+     * be one of our allowed
+     * origins. Requests without Origin come from non-browser clients, which are not
+     * exposed to CSRF.
+     */
+    public void requireTrustedOrigin(HttpServletRequest request) {
+        String origin = request.getHeader("Origin");
+        if (origin != null && !corsProperties.allowedOrigins().contains(origin)) {
+            throw new BusinessException(ErrorCode.FORBIDDEN);
+        }
+    }
+
+    private ResponseCookie.ResponseCookieBuilder base(String value) {
+        return ResponseCookie.from(properties.cookieName(), value)
+                .httpOnly(true)
+                .secure(properties.cookieSecure())
+                .sameSite(properties.cookieSameSite())
+                .path(properties.cookiePath());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\RefreshTokenRepository.java ===
+package tutorjava.digitalbanking.auth;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+public interface RefreshTokenRepository extends JpaRepository<RefreshToken, UUID> {
+
+    Optional<RefreshToken> findByTokenHash(String tokenHash);
+
+    /**
+     * Atomic compare-and-set: returns 1 only for the single caller that wins the
+     * rotation.
+     */
+    @Modifying
+    @Query("update RefreshToken t set t.revokedAt = :now where t.id = :id and t.revokedAt is null")
+    int revokeIfActive(@Param("id") UUID id, @Param("now") Instant now);
+
+    @Modifying
+    @Query("update RefreshToken t set t.revokedAt = :now where t.familyId = :familyId and t.revokedAt is null")
+    int revokeFamily(@Param("familyId") UUID familyId, @Param("now") Instant now);
+
+    @Modifying
+    @Query("update RefreshToken t set t.revokedAt = :now where t.userId = :userId and t.revokedAt is null")
+    int revokeAllForUser(@Param("userId") UUID userId, @Param("now") Instant now);
+
+    @Modifying
+    @Query("delete from RefreshToken t where t.expiresAt < :now")
+    int deleteExpired(@Param("now") Instant now);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\RefreshTokenService.java ===
+package tutorjava.digitalbanking.auth;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.common.util.Sha256;
+import tutorjava.digitalbanking.config.RefreshTokenProperties;
+import tutorjava.digitalbanking.user.User;
+import tutorjava.digitalbanking.user.UserRepository;
+
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.UUID;
+
+/**
+ * Refresh-token lifecycle with rotation and reuse detection.
+ *
+ * - login -> new family (a "session") with its first token
+ * - refresh -> the presented token is atomically revoked and replaced by a new
+ * one in the same family
+ * - reuse -> presenting a token that was already used/revoked means it was
+ * probably stolen:
+ * the whole family is revoked, so the thief AND the victim must log in again
+ * - logout -> the whole family is revoked
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class RefreshTokenService {
+
+    private static final int TOKEN_BYTES = 32; // 256 bits of entropy
+
+    private final RefreshTokenRepository repository;
+    private final UserRepository userRepository;
+    private final RefreshTokenProperties properties;
+    private final SecureRandom secureRandom = new SecureRandom();
+
+    public record RotatedSession(User user, IssuedRefreshToken refreshToken) {
+    }
+
+    @Transactional
+    public IssuedRefreshToken startSession(UUID userId) {
+        Instant now = Instant.now();
+        return issue(userId, UUID.randomUUID(), now, now);
+    }
+
+    /**
+     * noRollbackFor: when reuse is detected we revoke the family and THEN throw
+     * 401. The revocation
+     * must be committed, so this exception must not roll the transaction back.
+     */
+    @Transactional(noRollbackFor = BusinessException.class)
+    public RotatedSession rotate(String rawToken) {
+        Instant now = Instant.now();
+        RefreshToken stored = repository.findByTokenHash(Sha256.hex(rawToken))
+                .orElseThrow(() -> new BusinessException(ErrorCode.INVALID_REFRESH_TOKEN));
+
+        if (stored.getRevokedAt() != null) {
+            throw reuseDetected(stored, now);
+        }
+        if (stored.isExpired(now)) {
+            throw new BusinessException(ErrorCode.INVALID_REFRESH_TOKEN);
+        }
+        // Atomic claim: if two requests present the same token concurrently only one
+        // gets 1 here.
+        if (repository.revokeIfActive(stored.getId(), now) == 0) {
+            throw reuseDetected(stored, now);
+        }
+
+        User user = userRepository.findById(stored.getUserId()).filter(User::isEnabled).orElse(null);
+        if (user == null) {
+            repository.revokeFamily(stored.getFamilyId(), now);
+            throw new BusinessException(ErrorCode.INVALID_REFRESH_TOKEN);
+        }
+
+        IssuedRefreshToken next = issue(user.getId(), stored.getFamilyId(), stored.getSessionStartedAt(), now);
+        log.atInfo().addKeyValue("userId", user.getId()).log("Refresh token rotated");
+        return new RotatedSession(user, next);
+    }
+
+    /** Idempotent: unknown/expired/already revoked tokens are silently ignored. */
+    @Transactional
+    public void revokeSession(String rawToken) {
+        repository.findByTokenHash(Sha256.hex(rawToken)).ifPresent(token -> {
+            repository.revokeFamily(token.getFamilyId(), Instant.now());
+            log.atInfo().addKeyValue("userId", token.getUserId()).log("Session revoked (logout)");
+        });
+    }
+
+    @Transactional
+    public void revokeAllForUser(UUID userId) {
+        int revoked = repository.revokeAllForUser(userId, Instant.now());
+        log.atInfo().addKeyValue("userId", userId).addKeyValue("revokedTokens", revoked)
+                .log("All sessions revoked (logout everywhere)");
+    }
+
+    private IssuedRefreshToken issue(UUID userId, UUID familyId, Instant sessionStartedAt, Instant now) {
+        Instant slidingExpiry = now.plus(properties.ttl());
+        Instant absoluteExpiry = sessionStartedAt.plus(properties.absoluteTtl());
+        Instant expiresAt = slidingExpiry.isBefore(absoluteExpiry) ? slidingExpiry : absoluteExpiry;
+
+        String raw = generateRawToken();
+        repository.save(RefreshToken.create(userId, familyId, Sha256.hex(raw), sessionStartedAt, expiresAt));
+        return new IssuedRefreshToken(raw, expiresAt);
+    }
+
+    private BusinessException reuseDetected(RefreshToken stored, Instant now) {
+        repository.revokeFamily(stored.getFamilyId(), now);
+        log.atWarn()
+                .addKeyValue("userId", stored.getUserId())
+                .addKeyValue("familyId", stored.getFamilyId())
+                .log("Refresh token reuse detected: session family revoked");
+        return new BusinessException(ErrorCode.INVALID_REFRESH_TOKEN);
+    }
+
+    private String generateRawToken() {
+        byte[] bytes = new byte[TOKEN_BYTES];
+        secureRandom.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\dto\AuthResponse.java ===
+package tutorjava.digitalbanking.auth.dto;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import io.swagger.v3.oas.annotations.media.Schema;
+import tutorjava.digitalbanking.security.IssuedToken;
+
+public record AuthResponse(
+        String accessToken,
+        @Schema(example = "Bearer") String tokenType,
+        @Schema(description = "Access token lifetime in seconds", example = "900") long expiresIn,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @Schema(description = "Only returned to mobile clients (header X-Client-Type: mobile). "
+                + "Browsers receive it as an HttpOnly cookie instead.") String refreshToken) {
+
+    public static AuthResponse from(IssuedToken token, String refreshToken) {
+        return new AuthResponse(token.value(), "Bearer", token.expiresInSeconds(), refreshToken);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\dto\LoginRequest.java ===
+package tutorjava.digitalbanking.auth.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public record LoginRequest(
+        @Schema(example = "budi@example.com") @NotBlank @Email @Size(max = 254) String email,
+
+        @Schema(example = "Str0ngPassw0rd!") @NotBlank @Size(max = 72) String password) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\dto\RefreshRequest.java ===
+package tutorjava.digitalbanking.auth.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.Size;
+
+/**
+ * Mobile clients send the refresh token in the body. Browsers send nothing: the
+ * HttpOnly cookie is used.
+ */
+public record RefreshRequest(
+        @Schema(description = "Mobile only. Omit for browsers (the HttpOnly cookie is used instead).") @Size(max = 256) String refreshToken) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\auth\dto\RegisterRequest.java ===
+package tutorjava.digitalbanking.auth.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+
+public record RegisterRequest(
+        @Schema(example = "budi@example.com") @NotBlank @Email @Size(max = 254) String email,
+
+        @Schema(example = "Budi Santoso") @NotBlank @Size(max = 100) String fullName,
+
+        @Schema(example = "Str0ngPassw0rd!", description = "8-72 printable ASCII chars, at least one letter and one digit") @NotBlank @Pattern(regexp = "^(?=.*[A-Za-z])(?=.*\\d)[\\x21-\\x7E]{8,72}$", message = "must be 8-72 printable ASCII characters (no spaces) with at least one letter and one digit") String password) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\entity\AuditableEntity.java ===
+package tutorjava.digitalbanking.common.entity;
+
+import java.time.Instant;
+
+import org.springframework.data.annotation.LastModifiedDate;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.MappedSuperclass;
+import jakarta.persistence.Version;
+import lombok.Getter;
+
+/**
+ * Mutable aggregates additionally carry updated_at and an optimistic-lock
+ * version.
+ */
+@Getter
+@MappedSuperclass
+public abstract class AuditableEntity extends BaseEntity {
+
+    @LastModifiedDate
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\entity\BaseEntity.java ===
+package tutorjava.digitalbanking.common.entity;
+
+import java.time.Instant;
+import java.util.UUID;
+
+import org.hibernate.annotations.UuidGenerator;
+import org.springframework.data.annotation.CreatedDate;
+import org.springframework.data.jpa.domain.support.AuditingEntityListener;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.EntityListeners;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.Id;
+import jakarta.persistence.MappedSuperclass;
+import lombok.Getter;
+
+/**
+ * Base for all entities: time-ordered UUIDv7 id (index friendly) + creation
+ * timestamp.
+ */
+@Getter
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+public abstract class BaseEntity {
+
+    @Id
+    @GeneratedValue
+    @UuidGenerator(style = UuidGenerator.Style.VERSION_7)
+    @Column(name = "id", nullable = false, updatable = false)
+    private UUID id;
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\exception\BusinessException.java ===
+package tutorjava.digitalbanking.common.exception;
+
+import lombok.Getter;
+
+/**
+ * Expected, domain-level failure (not a bug). Stack trace is disabled because
+ * these
+ * are control-flow exceptions and filling it in is wasted work.
+ * Being a RuntimeException it triggers a rollback of the surrounding
+ * transaction.
+ */
+@Getter
+public class BusinessException extends RuntimeException {
+
+    private final ErrorCode errorCode;
+
+    public BusinessException(ErrorCode errorCode) {
+        this(errorCode, errorCode.getDefaultMessage());
+    }
+
+    public BusinessException(ErrorCode errorCode, String message) {
+        super(message, null, false, false);
+        this.errorCode = errorCode;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\exception\ErrorCode.java ===
+package tutorjava.digitalbanking.common.exception;
+
+import lombok.Getter;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+
+/**
+ * Single source of truth for machine-readable error codes returned to API
+ * clients.
+ */
+@Getter
+public enum ErrorCode {
+
+    VALIDATION_ERROR(HttpStatus.BAD_REQUEST, "Request validation failed"),
+    INVALID_IDEMPOTENCY_KEY(HttpStatus.BAD_REQUEST,
+            "Idempotency-Key must be 8-100 characters (letters, digits, '_', '-', '.', ':')"),
+
+    UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Authentication is required or the token is invalid"),
+    INVALID_CREDENTIALS(HttpStatus.UNAUTHORIZED, "Invalid email or password"),
+    INVALID_REFRESH_TOKEN(HttpStatus.UNAUTHORIZED, "Refresh token is invalid, expired or already used"),
+    FORBIDDEN(HttpStatus.FORBIDDEN, "You do not have permission to perform this action"),
+    USER_LOCKED(HttpStatus.LOCKED, "Too many failed login attempts. Please try again later"),
+
+    ACCOUNT_NOT_FOUND(HttpStatus.NOT_FOUND, "Account not found"),
+    TRANSACTION_NOT_FOUND(HttpStatus.NOT_FOUND, "Transaction not found"),
+
+    EMAIL_ALREADY_REGISTERED(HttpStatus.CONFLICT, "Email is already registered"),
+    CONCURRENT_UPDATE(HttpStatus.CONFLICT, "The resource was modified concurrently. Please retry"),
+    IDEMPOTENCY_IN_PROGRESS(HttpStatus.CONFLICT, "A request with this Idempotency-Key is still being processed"),
+    RESOURCE_CONFLICT(HttpStatus.CONFLICT, "The request conflicts with the current state of the resource"),
+
+    ACCOUNT_LIMIT_REACHED(HttpStatusCode.valueOf(422), "Maximum number of accounts reached"),
+    ACCOUNT_NOT_ACTIVE(HttpStatusCode.valueOf(422), "Account is not active"),
+    INSUFFICIENT_BALANCE(HttpStatusCode.valueOf(422), "Insufficient balance"),
+    SAME_ACCOUNT_TRANSFER(HttpStatusCode.valueOf(422), "Source and destination account must be different"),
+    CURRENCY_MISMATCH(HttpStatusCode.valueOf(422), "Source and destination account currency differ"),
+    AMOUNT_LIMIT_EXCEEDED(HttpStatusCode.valueOf(422), "Amount exceeds the maximum allowed per transaction"),
+    IDEMPOTENCY_KEY_REUSED(HttpStatusCode.valueOf(422),
+            "This Idempotency-Key was already used with a different request payload"),
+
+    INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred");
+
+    private final HttpStatusCode status;
+    private final String defaultMessage;
+
+    ErrorCode(HttpStatusCode status, String defaultMessage) {
+        this.status = status;
+        this.defaultMessage = defaultMessage;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\exception\GlobalExceptionHandler.java ===
+package tutorjava.digitalbanking.common.exception;
+
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.ConcurrencyFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.web.ErrorResponse;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.ServletWebRequest;
+import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
+import tutorjava.digitalbanking.common.response.ApiError;
+
+import java.util.List;
+
+/**
+ * Central error translation. Extends Spring's ResponseEntityExceptionHandler so
+ * framework
+ * exceptions (405, 415, malformed JSON, missing header, ...) also use the same
+ * ApiError shape.
+ * Internal details are logged, never returned to the client.
+ */
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    // ---------------------------------------------------------------- domain
+    // errors
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<ApiError> handleBusiness(BusinessException ex, HttpServletRequest request) {
+        ErrorCode code = ex.getErrorCode();
+        log.atWarn()
+                .addKeyValue("errorCode", code.name())
+                .addKeyValue("path", request.getRequestURI())
+                .log("Business rule rejected the request: {}", ex.getMessage());
+        return build(code, ex.getMessage(), request.getRequestURI());
+    }
+
+    // ---------------------------------------------------------------- persistence
+    // errors
+    /**
+     * Optimistic-lock failures, deadlocks, lock timeouts: safe for the client to
+     * retry.
+     */
+    @ExceptionHandler(ConcurrencyFailureException.class)
+    public ResponseEntity<ApiError> handleConcurrency(ConcurrencyFailureException ex, HttpServletRequest request) {
+        log.atWarn().addKeyValue("path", request.getRequestURI())
+                .log("Concurrent update detected: {}", ex.getClass().getSimpleName());
+        return build(ErrorCode.CONCURRENT_UPDATE, ErrorCode.CONCURRENT_UPDATE.getDefaultMessage(),
+                request.getRequestURI());
+    }
+
+    /**
+     * Unique/FK/CHECK violation that slipped past service-level checks. Never
+     * expose SQL details.
+     */
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<ApiError> handleDataIntegrity(DataIntegrityViolationException ex,
+            HttpServletRequest request) {
+        log.atWarn().addKeyValue("path", request.getRequestURI())
+                .log("Data integrity violation", ex);
+        return build(ErrorCode.RESOURCE_CONFLICT, ErrorCode.RESOURCE_CONFLICT.getDefaultMessage(),
+                request.getRequestURI());
+    }
+
+    // ---------------------------------------------------------------- security
+    // (when thrown from controllers)
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<ApiError> handleAuthentication(AuthenticationException ex, HttpServletRequest request) {
+        return build(ErrorCode.UNAUTHORIZED, ErrorCode.UNAUTHORIZED.getDefaultMessage(), request.getRequestURI());
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ApiError> handleAccessDenied(AccessDeniedException ex, HttpServletRequest request) {
+        return build(ErrorCode.FORBIDDEN, ErrorCode.FORBIDDEN.getDefaultMessage(), request.getRequestURI());
+    }
+
+    // ---------------------------------------------------------------- catch-all
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiError> handleUnexpected(Exception ex, HttpServletRequest request) {
+        log.atError().addKeyValue("path", request.getRequestURI())
+                .log("Unhandled exception", ex);
+        return build(ErrorCode.INTERNAL_ERROR, ErrorCode.INTERNAL_ERROR.getDefaultMessage(),
+                request.getRequestURI());
+    }
+
+    // ---------------------------------------------------------------- Spring MVC
+    // exceptions
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(MethodArgumentNotValidException ex,
+            HttpHeaders headers,
+            HttpStatusCode status,
+            WebRequest request) {
+        List<ApiError.FieldViolation> violations = ex.getBindingResult().getFieldErrors().stream()
+                .map(fe -> new ApiError.FieldViolation(fe.getField(), fe.getDefaultMessage()))
+                .toList();
+        ApiError body = ApiError.of(status, ErrorCode.VALIDATION_ERROR.name(),
+                ErrorCode.VALIDATION_ERROR.getDefaultMessage(), path(request), violations);
+        log.atWarn().addKeyValue("path", path(request))
+                .addKeyValue("violationCount", violations.size())
+                .log("Request validation failed");
+        return ResponseEntity.status(status).headers(headers).body(body);
+    }
+
+    /**
+     * Fallback for every other Spring MVC exception: keep status chosen by Spring,
+     * unify the body.
+     */
+    @Override
+    protected ResponseEntity<Object> handleExceptionInternal(Exception ex, Object body, HttpHeaders headers,
+            HttpStatusCode statusCode, WebRequest request) {
+        ProblemDetail problem = body instanceof ProblemDetail pd ? pd
+                : ex instanceof ErrorResponse er ? er.getBody() : null;
+
+        String message;
+        String code;
+        if (statusCode.is5xxServerError()) {
+            log.atError().addKeyValue("path", path(request)).log("Framework error", ex);
+            message = ErrorCode.INTERNAL_ERROR.getDefaultMessage();
+            code = ErrorCode.INTERNAL_ERROR.name();
+        } else {
+            message = problem != null && problem.getDetail() != null ? problem.getDetail() : "Bad request";
+            HttpStatus resolved = HttpStatus.resolve(statusCode.value());
+            code = resolved != null ? resolved.name() : "ERROR";
+            log.atWarn().addKeyValue("path", path(request)).addKeyValue("errorCode", code)
+                    .log("Request rejected: {}", ex.getClass().getSimpleName());
+        }
+        ApiError error = ApiError.of(statusCode, code, message, path(request));
+        return ResponseEntity.status(statusCode).headers(headers).body(error);
+    }
+
+    // ---------------------------------------------------------------- helpers
+    private ResponseEntity<ApiError> build(ErrorCode code, String message, String path) {
+        return ResponseEntity.status(code.getStatus())
+                .body(ApiError.of(code.getStatus(), code.name(), message, path));
+    }
+
+    private String path(WebRequest request) {
+        return request instanceof ServletWebRequest swr ? swr.getRequest().getRequestURI() : "";
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\response\ApiError.java ===
+package tutorjava.digitalbanking.common.response;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import io.swagger.v3.oas.annotations.media.Schema;
+import org.slf4j.MDC;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import tutorjava.digitalbanking.logging.RequestLoggingFilter;
+
+import java.time.Instant;
+import java.util.List;
+
+/**
+ * Uniform error envelope for every non-2xx response (including 401/403 from the
+ * security filters).
+ */
+@JsonInclude(JsonInclude.Include.NON_EMPTY)
+@Schema(description = "Standard error response")
+public record ApiError(
+        Instant timestamp,
+        int status,
+        String error,
+        @Schema(example = "INSUFFICIENT_BALANCE") String code,
+        String message,
+        String path,
+        @Schema(description = "Correlates with the X-Request-Id header and server logs") String requestId,
+        List<FieldViolation> violations) {
+
+    public record FieldViolation(String field, String message) {
+    }
+
+    public static ApiError of(HttpStatusCode status, String code, String message, String path,
+            List<FieldViolation> violations) {
+        HttpStatus resolved = HttpStatus.resolve(status.value());
+        String reason = resolved != null ? resolved.getReasonPhrase() : "Error";
+        return new ApiError(Instant.now(), status.value(), reason, code, message, path,
+                MDC.get(RequestLoggingFilter.MDC_REQUEST_ID), violations);
+    }
+
+    public static ApiError of(HttpStatusCode status, String code, String message, String path) {
+        return of(status, code, message, path, List.of());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\response\PageResponse.java ===
+package tutorjava.digitalbanking.common.response;
+
+import org.springframework.data.domain.Page;
+
+import java.util.List;
+
+/**
+ * Stable pagination envelope (does not leak Spring Data's Page serialization
+ * format).
+ */
+public record PageResponse<T>(
+        List<T> content,
+        int page,
+        int size,
+        long totalElements,
+        int totalPages) {
+
+    public static <T> PageResponse<T> from(Page<T> page) {
+        return new PageResponse<>(page.getContent(), page.getNumber(), page.getSize(),
+                page.getTotalElements(), page.getTotalPages());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\common\util\Sha256.java ===
+package tutorjava.digitalbanking.common.util;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+
+public final class Sha256 {
+
+    private Sha256() {
+    }
+
+    public static String hex(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\AuthProperties.java ===
+package tutorjava.digitalbanking.config;
+
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.time.Duration;
+
+@Validated
+@ConfigurationProperties(prefix = "app.auth")
+public record AuthProperties(
+        @Min(1) int maxFailedLoginAttempts,
+        @NotNull Duration lockDuration) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\BankingProperties.java ===
+package tutorjava.digitalbanking.config;
+
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.math.BigDecimal;
+
+@Validated
+@ConfigurationProperties(prefix = "app.banking")
+public record BankingProperties(
+        @NotBlank String currency,
+        @NotNull @DecimalMin("0.01") BigDecimal maxTransactionAmount,
+        @Min(1) int maxAccountsPerUser) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\CorsProperties.java ===
+package tutorjava.digitalbanking.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+import java.util.List;
+
+@ConfigurationProperties(prefix = "app.cors")
+public record CorsProperties(List<String> allowedOrigins) {
+
+    public CorsProperties {
+        allowedOrigins = allowedOrigins == null ? List.of() : List.copyOf(allowedOrigins);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\IdempotencyProperties.java ===
+package tutorjava.digitalbanking.config;
+
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.time.Duration;
+
+@Validated
+@ConfigurationProperties(prefix = "app.idempotency")
+public record IdempotencyProperties(@NotNull Duration ttl) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\JpaAuditingConfig.java ===
+package tutorjava.digitalbanking.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.jpa.repository.config.EnableJpaAuditing;
+
+@Configuration
+@EnableJpaAuditing
+public class JpaAuditingConfig {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\JwtProperties.java ===
+package tutorjava.digitalbanking.config;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.time.Duration;
+
+@Validated
+@ConfigurationProperties(prefix = "app.jwt")
+public record JwtProperties(
+        @NotBlank String secret,
+        @NotBlank String issuer,
+        @NotNull Duration accessTokenExpiration) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\OpenApiConfig.java ===
+package tutorjava.digitalbanking.config;
+
+import io.swagger.v3.oas.models.Components;
+import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.info.Info;
+import io.swagger.v3.oas.models.security.SecurityScheme;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class OpenApiConfig {
+
+    public static final String BEARER_SCHEME = "bearerAuth";
+
+    @Bean
+    public OpenAPI digitalBankingOpenApi() {
+        return new OpenAPI()
+                .info(new Info()
+                        .title("Digital Banking API")
+                        .version("v1")
+                        .description("""
+                                Simple digital banking REST API.
+
+                                **How to use:** register -> login -> click *Authorize* and paste the access token.
+                                Every money movement (deposit, withdrawal, transfer) requires an `Idempotency-Key`
+                                header (8-100 chars, e.g. a UUID). Retrying with the same key and the same payload
+                                returns the original result instead of moving money twice."""))
+                .components(new Components().addSecuritySchemes(BEARER_SCHEME,
+                        new SecurityScheme()
+                                .type(SecurityScheme.Type.HTTP)
+                                .scheme("bearer")
+                                .bearerFormat("JWT")));
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\RefreshTokenProperties.java ===
+package tutorjava.digitalbanking.config;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.time.Duration;
+
+/**
+ * @param ttl            sliding lifetime of each refresh token (renewed on
+ *                       every rotation)
+ * @param absoluteTtl    hard cap of a login session: the user must log in again
+ *                       after this, no matter what
+ * @param cookieSecure   send the cookie over HTTPS only (set false only for
+ *                       plain-http local development)
+ * @param cookieSameSite Strict (same-site frontend) / Lax / None (cross-site
+ *                       frontend, requires secure=true)
+ */
+@Validated
+@ConfigurationProperties(prefix = "app.refresh-token")
+public record RefreshTokenProperties(
+        @NotNull Duration ttl,
+        @NotNull Duration absoluteTtl,
+        @NotBlank String cookieName,
+        @NotBlank String cookiePath,
+        boolean cookieSecure,
+        @NotBlank String cookieSameSite) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\config\SecurityConfig.java ===
+package tutorjava.digitalbanking.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import tutorjava.digitalbanking.security.JwtAuthenticationFilter;
+import tutorjava.digitalbanking.security.JwtService;
+import tutorjava.digitalbanking.security.RestAccessDeniedHandler;
+import tutorjava.digitalbanking.security.RestAuthenticationEntryPoint;
+
+import java.util.List;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+        private static final String[] PUBLIC_ENDPOINTS = {
+                        "/api/v1/auth/register",
+                        "/api/v1/auth/login",
+                        "/api/v1/auth/refresh",
+                        "/api/v1/auth/logout",
+                        "/actuator/health/**",
+                        "/v3/api-docs/**",
+                        "/swagger-ui.html",
+                        "/swagger-ui/**"
+        };
+
+        @Bean
+        public SecurityFilterChain securityFilterChain(HttpSecurity http,
+                        JwtService jwtService,
+                        RestAuthenticationEntryPoint entryPoint,
+                        RestAccessDeniedHandler accessDeniedHandler,
+                        CorsConfigurationSource corsConfigurationSource)
+                        throws Exception {
+                http
+                                // Stateless bearer-token API: no cookies/session, so CSRF protection is not
+                                // applicable.
+                                .csrf(AbstractHttpConfigurer::disable)
+                                .cors(cors -> cors.configurationSource(corsConfigurationSource))
+                                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                                .formLogin(AbstractHttpConfigurer::disable)
+                                .httpBasic(AbstractHttpConfigurer::disable)
+                                .logout(AbstractHttpConfigurer::disable)
+                                .headers(headers -> headers
+                                                .frameOptions(frame -> frame.deny())
+                                                .httpStrictTransportSecurity(hsts -> hsts
+                                                                .includeSubDomains(true)
+                                                                .maxAgeInSeconds(31_536_000))
+                                                .referrerPolicy(ref -> ref.policy(ReferrerPolicy.NO_REFERRER))
+                                                .contentTypeOptions(Customizer.withDefaults()))
+                                .authorizeHttpRequests(auth -> auth
+                                                .requestMatchers(PUBLIC_ENDPOINTS).permitAll()
+                                                .anyRequest().authenticated())
+                                .exceptionHandling(ex -> ex
+                                                .authenticationEntryPoint(entryPoint)
+                                                .accessDeniedHandler(accessDeniedHandler))
+                                .addFilterBefore(new JwtAuthenticationFilter(jwtService),
+                                                UsernamePasswordAuthenticationFilter.class);
+                return http.build();
+        }
+
+        /** BCrypt with cost 12 (adaptive hash with per-password salt). */
+        @Bean
+        public PasswordEncoder passwordEncoder() {
+                return new BCryptPasswordEncoder(12);
+        }
+
+        @Bean
+        public CorsConfigurationSource corsConfigurationSource(CorsProperties properties) {
+                CorsConfiguration config = new CorsConfiguration();
+                config.setAllowedOrigins(properties.allowedOrigins());
+                config.setAllowedMethods(List.of("GET", "POST", "OPTIONS"));
+                config.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id",
+                                "X-Client-Type"));
+                config.setExposedHeaders(List.of("X-Request-Id", "Idempotent-Replayed", "Location"));
+                config.setAllowCredentials(true); // browsers must be allowed to send the refresh-token cookie
+                config.setMaxAge(3600L);
+
+                UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+                source.registerCorsConfiguration("/api/**", config);
+                return source;
+        }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\idempotency\IdempotencyClaim.java ===
+package tutorjava.digitalbanking.idempotency;
+
+import java.util.UUID;
+
+/** Outcome of trying to claim an Idempotency-Key. */
+public sealed interface IdempotencyClaim {
+
+    /**
+     * First time we see this key: caller must execute the operation, then call
+     * complete().
+     */
+    record Fresh(UUID claimId) implements IdempotencyClaim {
+    }
+
+    /**
+     * Same key + same payload was already processed: return the stored result, do
+     * nothing.
+     */
+    record Replay(UUID transactionId) implements IdempotencyClaim {
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\idempotency\IdempotencyCleanupJob.java ===
+package tutorjava.digitalbanking.idempotency;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+
+/**
+ * Housekeeping: expired keys are purged hourly. Safe to run on several
+ * instances (idempotent DELETE).
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class IdempotencyCleanupJob {
+
+    private final IdempotencyKeyRepository repository;
+
+    @Scheduled(cron = "0 15 * * * *")
+    @Transactional
+    public void purgeExpired() {
+        int deleted = repository.deleteExpired(Instant.now());
+        log.atInfo().addKeyValue("deleted", deleted).log("Expired idempotency keys purged");
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\idempotency\IdempotencyKey.java ===
+package tutorjava.digitalbanking.idempotency;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+
+import java.time.Instant;
+import java.util.UUID;
+
+/**
+ * Row inserted (via native INSERT ... ON CONFLICT DO NOTHING) in the SAME
+ * database transaction as the
+ * money movement. transaction_id is filled in before commit, so a committed row
+ * always has a result.
+ */
+@Getter
+@Entity
+@Table(name = "idempotency_keys")
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class IdempotencyKey {
+
+    @Id
+    @Column(name = "id", nullable = false, updatable = false)
+    private UUID id;
+
+    @Column(name = "user_id", nullable = false, updatable = false)
+    private UUID userId;
+
+    @Column(name = "idempotency_key", nullable = false, updatable = false, length = 100)
+    private String idempotencyKey;
+
+    @Column(name = "request_hash", nullable = false, updatable = false, length = 64)
+    private String requestHash;
+
+    @Column(name = "transaction_id")
+    private UUID transactionId;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "expires_at", nullable = false, updatable = false)
+    private Instant expiresAt;
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\idempotency\IdempotencyKeyRepository.java ===
+package tutorjava.digitalbanking.idempotency;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.Optional;
+import java.util.UUID;
+
+public interface IdempotencyKeyRepository extends JpaRepository<IdempotencyKey, UUID> {
+
+    /**
+     * Atomic "claim": returns 1 when this request won the key, 0 when the key
+     * already exists.
+     * If another in-flight transaction holds the same key, PostgreSQL makes this
+     * statement wait
+     * until that transaction commits or rolls back, which serialises concurrent
+     * duplicates.
+     */
+    @Modifying
+    @Query(value = """
+            INSERT INTO idempotency_keys (id, user_id, idempotency_key, request_hash, created_at, expires_at)
+            VALUES (:id, :userId, :key, :requestHash, :createdAt, :expiresAt)
+            ON CONFLICT (user_id, idempotency_key) DO NOTHING
+            """, nativeQuery = true)
+    int insertIfAbsent(@Param("id") UUID id,
+            @Param("userId") UUID userId,
+            @Param("key") String key,
+            @Param("requestHash") String requestHash,
+            @Param("createdAt") Instant createdAt,
+            @Param("expiresAt") Instant expiresAt);
+
+    Optional<IdempotencyKey> findByUserIdAndIdempotencyKey(UUID userId, String idempotencyKey);
+
+    @Modifying
+    @Query("update IdempotencyKey k set k.transactionId = :transactionId where k.id = :id")
+    int attachTransaction(@Param("id") UUID id, @Param("transactionId") UUID transactionId);
+
+    @Modifying
+    @Query("delete from IdempotencyKey k where k.expiresAt < :now")
+    int deleteExpired(@Param("now") Instant now);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\idempotency\IdempotencyService.java ===
+package tutorjava.digitalbanking.idempotency;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.common.util.Sha256;
+import tutorjava.digitalbanking.config.IdempotencyProperties;
+
+import java.time.Instant;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+/**
+ * Exactly-once semantics for money-moving requests.
+ *
+ * The claim row and the business change live in ONE database transaction:
+ * - success -> both commit together (key + result recorded atomically)
+ * - failure -> both roll back (client may retry with the same key and it is
+ * re-evaluated)
+ * - duplicate (sequential or concurrent) -> the unique index makes the loser
+ * wait, then replay the stored result
+ * - same key with another payload -> rejected (422), protects against client
+ * bugs
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class IdempotencyService {
+
+    public static final String HEADER = "Idempotency-Key";
+
+    private static final Pattern KEY_PATTERN = Pattern.compile("^[A-Za-z0-9_.:-]{8,100}$");
+
+    private final IdempotencyKeyRepository repository;
+    private final IdempotencyProperties properties;
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public IdempotencyClaim claim(UUID userId, String key, String requestFingerprint) {
+        if (key == null || !KEY_PATTERN.matcher(key).matches()) {
+            throw new BusinessException(ErrorCode.INVALID_IDEMPOTENCY_KEY);
+        }
+        String requestHash = Sha256.hex(requestFingerprint);
+        Instant now = Instant.now();
+        UUID claimId = UUID.randomUUID();
+
+        int inserted = repository.insertIfAbsent(claimId, userId, key, requestHash, now,
+                now.plus(properties.ttl()));
+        if (inserted == 1) {
+            return new IdempotencyClaim.Fresh(claimId);
+        }
+
+        IdempotencyKey existing = repository.findByUserIdAndIdempotencyKey(userId, key)
+                .orElseThrow(() -> new BusinessException(ErrorCode.IDEMPOTENCY_IN_PROGRESS));
+        if (!existing.getRequestHash().equals(requestHash)) {
+            log.atWarn().addKeyValue("userId", userId).log("Idempotency-Key reused with a different payload");
+            throw new BusinessException(ErrorCode.IDEMPOTENCY_KEY_REUSED);
+        }
+        if (existing.getTransactionId() == null) {
+            throw new BusinessException(ErrorCode.IDEMPOTENCY_IN_PROGRESS);
+        }
+        log.atInfo().addKeyValue("userId", userId)
+                .addKeyValue("transactionId", existing.getTransactionId())
+                .log("Idempotent replay: returning stored result");
+        return new IdempotencyClaim.Replay(existing.getTransactionId());
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void complete(UUID claimId, UUID transactionId) {
+        repository.attachTransaction(claimId, transactionId);
+    }
+
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\logging\RequestLoggingFilter.java ===
+package tutorjava.digitalbanking.logging;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+/**
+ * Runs before Spring Security. Responsibilities:
+ * 1. correlation id: accept a (sanitised) X-Request-Id or generate one, echo it
+ * back, put it in the MDC;
+ * 2. one structured access-log line per request (method, path, status,
+ * duration, user).
+ * Every log line written while handling the request automatically carries
+ * requestId/userId via the MDC.
+ */
+@Slf4j
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class RequestLoggingFilter extends OncePerRequestFilter {
+
+    public static final String REQUEST_ID_HEADER = "X-Request-Id";
+    public static final String MDC_REQUEST_ID = "requestId";
+    public static final String MDC_USER_ID = "userId";
+
+    /** Prevents log injection through a client supplied id. */
+    private static final Pattern SAFE_REQUEST_ID = Pattern.compile("^[A-Za-z0-9._-]{8,64}$");
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+            FilterChain chain) throws ServletException, IOException {
+        String requestId = resolveRequestId(request.getHeader(REQUEST_ID_HEADER));
+        MDC.put(MDC_REQUEST_ID, requestId);
+        response.setHeader(REQUEST_ID_HEADER, requestId);
+
+        long startNanos = System.nanoTime();
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            long durationMs = (System.nanoTime() - startNanos) / 1_000_000;
+            String path = request.getRequestURI();
+            var event = path.startsWith("/actuator") ? log.atDebug() : log.atInfo();
+            event.addKeyValue("method", request.getMethod())
+                    .addKeyValue("path", path)
+                    .addKeyValue("status", response.getStatus())
+                    .addKeyValue("durationMs", durationMs)
+                    .log("HTTP request completed");
+            MDC.clear();
+        }
+    }
+
+    private String resolveRequestId(String incoming) {
+        return incoming != null && SAFE_REQUEST_ID.matcher(incoming).matches()
+                ? incoming
+                : UUID.randomUUID().toString();
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\AuthenticatedUser.java ===
+package tutorjava.digitalbanking.security;
+
+import tutorjava.digitalbanking.user.UserRole;
+
+import java.util.UUID;
+
+/**
+ * Principal placed in the SecurityContext after a JWT was verified. Resolve
+ * with @AuthenticationPrincipal.
+ */
+public record AuthenticatedUser(UUID id, String email, UserRole role) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\IssuedToken.java ===
+package tutorjava.digitalbanking.security;
+
+public record IssuedToken(String value, long expiresInSeconds) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\JwtAuthenticationFilter.java ===
+package tutorjava.digitalbanking.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.slf4j.MDC;
+import org.springframework.http.HttpHeaders;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.web.filter.OncePerRequestFilter;
+import tutorjava.digitalbanking.logging.RequestLoggingFilter;
+
+import java.io.IOException;
+import java.util.List;
+
+/**
+ * Reads "Authorization: Bearer <jwt>" and populates the SecurityContext.
+ * Deliberately NOT a @Component: it is created inside SecurityConfig so that
+ * Spring Boot does not additionally register it as a plain servlet filter.
+ * An invalid token simply leaves the request unauthenticated; the entry point
+ * answers 401.
+ */
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private static final String BEARER_PREFIX = "Bearer ";
+
+    private final JwtService jwtService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+            FilterChain chain) throws ServletException, IOException {
+        String header = request.getHeader(HttpHeaders.AUTHORIZATION);
+        if (header != null && header.startsWith(BEARER_PREFIX)) {
+            jwtService.parseAndValidate(header.substring(BEARER_PREFIX.length()).trim())
+                    .ifPresent(user -> authenticate(user, request));
+        }
+        chain.doFilter(request, response);
+    }
+
+    private void authenticate(AuthenticatedUser user, HttpServletRequest request) {
+        var authentication = UsernamePasswordAuthenticationToken.authenticated(
+                user, null, List.of(new SimpleGrantedAuthority("ROLE_" + user.role().name())));
+        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+        MDC.put(RequestLoggingFilter.MDC_USER_ID, user.id().toString());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\JwtService.java ===
+package tutorjava.digitalbanking.security;
+
+import com.nimbusds.jose.JOSEException;
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.JWSSigner;
+import com.nimbusds.jose.JWSVerifier;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jose.crypto.MACVerifier;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import tutorjava.digitalbanking.config.JwtProperties;
+import tutorjava.digitalbanking.user.User;
+import tutorjava.digitalbanking.user.UserRole;
+
+import java.text.ParseException;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.Date;
+import java.util.Optional;
+import java.util.UUID;
+
+/**
+ * Issues and validates HS256 access tokens (Nimbus JOSE+JWT).
+ * Validation pins the algorithm, verifies the signature, issuer and expiry.
+ * Fails fast at startup when the secret is missing, not base64 or shorter than
+ * 256 bits.
+ */
+@Slf4j
+@Service
+public class JwtService {
+
+    private static final String CLAIM_EMAIL = "email";
+    private static final String CLAIM_ROLE = "role";
+
+    private final JwtProperties properties;
+    private final JWSSigner signer;
+    private final JWSVerifier verifier;
+
+    public JwtService(JwtProperties properties) {
+        this.properties = properties;
+        try {
+            byte[] secret = Base64.getDecoder().decode(properties.secret());
+            if (secret.length < 32) {
+                throw new IllegalStateException("app.jwt.secret must decode to at least 32 bytes (256 bits)");
+            }
+            this.signer = new MACSigner(secret);
+            this.verifier = new MACVerifier(secret);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException("app.jwt.secret must be base64 encoded (openssl rand -base64 48)", e);
+        } catch (JOSEException e) {
+            throw new IllegalStateException("Unable to initialise JWT signer/verifier", e);
+        }
+    }
+
+    public IssuedToken generateAccessToken(User user) {
+        Instant now = Instant.now();
+        Instant expiry = now.plus(properties.accessTokenExpiration());
+
+        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+                .issuer(properties.issuer())
+                .subject(user.getId().toString())
+                .jwtID(UUID.randomUUID().toString())
+                .issueTime(Date.from(now))
+                .expirationTime(Date.from(expiry))
+                .claim(CLAIM_EMAIL, user.getEmail())
+                .claim(CLAIM_ROLE, user.getRole().name())
+                .build();
+
+        try {
+            SignedJWT jwt = new SignedJWT(new JWSHeader(JWSAlgorithm.HS256), claims);
+            jwt.sign(signer);
+            return new IssuedToken(jwt.serialize(), properties.accessTokenExpiration().toSeconds());
+        } catch (JOSEException e) {
+            throw new IllegalStateException("Unable to sign JWT", e);
+        }
+    }
+
+    /**
+     * Returns the principal for a valid token, or empty for anything wrong (never
+     * throws).
+     */
+    public Optional<AuthenticatedUser> parseAndValidate(String token) {
+        try {
+            SignedJWT jwt = SignedJWT.parse(token);
+            if (!JWSAlgorithm.HS256.equals(jwt.getHeader().getAlgorithm()) || !jwt.verify(verifier)) {
+                log.debug("JWT rejected: bad algorithm or signature");
+                return Optional.empty();
+            }
+            JWTClaimsSet claims = jwt.getJWTClaimsSet();
+            Date expiration = claims.getExpirationTime();
+            if (!properties.issuer().equals(claims.getIssuer())
+                    || expiration == null
+                    || expiration.toInstant().isBefore(Instant.now())) {
+                log.debug("JWT rejected: bad issuer or expired");
+                return Optional.empty();
+            }
+            return Optional.of(new AuthenticatedUser(
+                    UUID.fromString(claims.getSubject()),
+                    claims.getStringClaim(CLAIM_EMAIL),
+                    UserRole.valueOf(claims.getStringClaim(CLAIM_ROLE))));
+        } catch (ParseException | JOSEException | IllegalArgumentException | NullPointerException e) {
+            log.debug("JWT rejected: {}", e.getClass().getSimpleName());
+            return Optional.empty();
+        }
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\RestAccessDeniedHandler.java ===
+package tutorjava.digitalbanking.security;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+
+import java.io.IOException;
+
+/** 403 for authenticated users lacking the required role. */
+@Component
+@RequiredArgsConstructor
+public class RestAccessDeniedHandler implements AccessDeniedHandler {
+
+    private final SecurityErrorWriter errorWriter;
+
+    @Override
+    public void handle(HttpServletRequest request, HttpServletResponse response,
+            AccessDeniedException accessDeniedException) throws IOException {
+        errorWriter.write(request, response, ErrorCode.FORBIDDEN);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\RestAuthenticationEntryPoint.java ===
+package tutorjava.digitalbanking.security;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpHeaders;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.AuthenticationEntryPoint;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+
+import java.io.IOException;
+
+/** 401 for missing / invalid / expired tokens. */
+@Component
+@RequiredArgsConstructor
+public class RestAuthenticationEntryPoint implements AuthenticationEntryPoint {
+
+    private final SecurityErrorWriter errorWriter;
+
+    @Override
+    public void commence(HttpServletRequest request, HttpServletResponse response,
+            AuthenticationException authException) throws IOException {
+        response.setHeader(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
+        errorWriter.write(request, response, ErrorCode.UNAUTHORIZED);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\security\SecurityErrorWriter.java ===
+package tutorjava.digitalbanking.security;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import tools.jackson.databind.json.JsonMapper;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.common.response.ApiError;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Writes the standard ApiError JSON from servlet filters
+ * (where @RestControllerAdvice does not apply).
+ */
+@Component
+@RequiredArgsConstructor
+public class SecurityErrorWriter {
+
+    private final JsonMapper jsonMapper;
+
+    public void write(HttpServletRequest request, HttpServletResponse response, ErrorCode code)
+            throws IOException {
+        response.setStatus(code.getStatus().value());
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+        jsonMapper.writeValue(response.getWriter(),
+                ApiError.of(code.getStatus(), code.name(), code.getDefaultMessage(), request.getRequestURI()));
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\EntryDirection.java ===
+package tutorjava.digitalbanking.transaction;
+
+public enum EntryDirection {
+    DEBIT,
+    CREDIT
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\LedgerEntry.java ===
+package tutorjava.digitalbanking.transaction;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.Immutable;
+import tutorjava.digitalbanking.common.entity.BaseEntity;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+
+/** One side of a transaction on one account, with the resulting balance (running balance statement). */
+@Getter
+@Immutable
+@Entity
+@Table(name = "ledger_entries")
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class LedgerEntry extends BaseEntity {
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "transaction_id", nullable = false, updatable = false)
+    private Transaction transaction;
+
+    @Column(name = "account_id", nullable = false, updatable = false)
+    private UUID accountId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "direction", nullable = false, updatable = false, length = 10)
+    private EntryDirection direction;
+
+    @Column(name = "amount", nullable = false, updatable = false, precision = 19, scale = 2)
+    private BigDecimal amount;
+
+    @Column(name = "balance_after", nullable = false, updatable = false, precision = 19, scale = 2)
+    private BigDecimal balanceAfter;
+
+    public static LedgerEntry of(Transaction transaction, UUID accountId, EntryDirection direction,
+                                 BigDecimal amount, BigDecimal balanceAfter) {
+        LedgerEntry entry = new LedgerEntry();
+        entry.transaction = transaction;
+        entry.accountId = accountId;
+        entry.direction = direction;
+        entry.amount = amount;
+        entry.balanceAfter = balanceAfter;
+        return entry;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\LedgerEntryRepository.java ===
+package tutorjava.digitalbanking.transaction;
+
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import tutorjava.digitalbanking.transaction.dto.AccountMutationResponse;
+
+import java.util.UUID;
+
+public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, UUID> {
+
+    /**
+     * Account statement. Projects straight into a DTO (no entity hydration, no N+1) and is served by
+     * idx_ledger_account_created (account_id, created_at DESC, id DESC).
+     */
+    @Query(value = """
+            select new tutorjava.digitalbanking.transaction.dto.AccountMutationResponse(
+                t.referenceNo, t.type, e.direction, e.amount, e.balanceAfter, t.description, e.createdAt)
+            from LedgerEntry e join e.transaction t
+            where e.accountId = :accountId
+            order by e.createdAt desc, e.id desc
+            """,
+            countQuery = "select count(e) from LedgerEntry e where e.accountId = :accountId")
+    Page<AccountMutationResponse> findStatement(@Param("accountId") UUID accountId, Pageable pageable);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\Transaction.java ===
+package tutorjava.digitalbanking.transaction;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.Immutable;
+import tutorjava.digitalbanking.common.entity.BaseEntity;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+
+/** Immutable financial fact (also enforced by a DB trigger). Corrections are new transactions. */
+@Getter
+@Immutable
+@Entity
+@Table(name = "transactions")
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class Transaction extends BaseEntity {
+
+    @Column(name = "reference_no", nullable = false, updatable = false, length = 30)
+    private String referenceNo;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "type", nullable = false, updatable = false, length = 20)
+    private TransactionType type;
+
+    @Column(name = "amount", nullable = false, updatable = false, precision = 19, scale = 2)
+    private BigDecimal amount;
+
+    @Column(name = "currency", nullable = false, updatable = false, length = 3)
+    private String currency;
+
+    @Column(name = "source_account_number", updatable = false, length = 10)
+    private String sourceAccountNumber;
+
+    @Column(name = "destination_account_number", updatable = false, length = 10)
+    private String destinationAccountNumber;
+
+    @Column(name = "description", updatable = false, length = 140)
+    private String description;
+
+    @Column(name = "created_by", nullable = false, updatable = false)
+    private UUID createdBy;
+
+    @Builder
+    private Transaction(String referenceNo, TransactionType type, BigDecimal amount, String currency,
+                        String sourceAccountNumber, String destinationAccountNumber,
+                        String description, UUID createdBy) {
+        this.referenceNo = referenceNo;
+        this.type = type;
+        this.amount = amount;
+        this.currency = currency;
+        this.sourceAccountNumber = sourceAccountNumber;
+        this.destinationAccountNumber = destinationAccountNumber;
+        this.description = description;
+        this.createdBy = createdBy;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionCommand.java ===
+package tutorjava.digitalbanking.transaction;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.UUID;
+
+/**
+ * Internal, transport-independent description of "what the user wants to do".
+ * The controller maps each request DTO to a command; processors only know about commands.
+ */
+public record TransactionCommand(
+        UUID userId,
+        TransactionType type,
+        String sourceAccountNumber,
+        String destinationAccountNumber,
+        BigDecimal amount,
+        String description) {
+
+    public TransactionCommand {
+        // request validation already limits the scale to 2, so this never rounds
+        amount = amount.setScale(2, RoundingMode.UNNECESSARY);
+        description = description == null || description.isBlank() ? null : description.trim();
+    }
+
+    public static TransactionCommand deposit(UUID userId, String accountNumber, BigDecimal amount, String description) {
+        return new TransactionCommand(userId, TransactionType.DEPOSIT, null, accountNumber, amount, description);
+    }
+
+    public static TransactionCommand withdrawal(UUID userId, String accountNumber, BigDecimal amount, String description) {
+        return new TransactionCommand(userId, TransactionType.WITHDRAWAL, accountNumber, null, amount, description);
+    }
+
+    public static TransactionCommand transfer(UUID userId, String source, String destination,
+                                              BigDecimal amount, String description) {
+        return new TransactionCommand(userId, TransactionType.TRANSFER, source, destination, amount, description);
+    }
+
+    /** Canonical string of everything that defines the request; hashed for idempotency comparison. */
+    public String fingerprint() {
+        return String.join("|", type.name(),
+                String.valueOf(sourceAccountNumber),
+                String.valueOf(destinationAccountNumber),
+                amount.toPlainString(),
+                String.valueOf(description));
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionController.java ===
+package tutorjava.digitalbanking.transaction;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.headers.Header;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import tutorjava.digitalbanking.common.response.ApiError;
+import tutorjava.digitalbanking.common.response.PageResponse;
+import tutorjava.digitalbanking.config.OpenApiConfig;
+import tutorjava.digitalbanking.idempotency.IdempotencyService;
+import tutorjava.digitalbanking.security.AuthenticatedUser;
+import tutorjava.digitalbanking.transaction.dto.AccountMutationResponse;
+import tutorjava.digitalbanking.transaction.dto.DepositRequest;
+import tutorjava.digitalbanking.transaction.dto.TransactionResponse;
+import tutorjava.digitalbanking.transaction.dto.TransferRequest;
+import tutorjava.digitalbanking.transaction.dto.WithdrawalRequest;
+
+import java.net.URI;
+
+@RestController
+@RequestMapping("/api/v1")
+@RequiredArgsConstructor
+@Tag(name = "Transactions", description = "Money movements (idempotent) and statements")
+@SecurityRequirement(name = OpenApiConfig.BEARER_SCHEME)
+public class TransactionController {
+
+    private static final String REPLAY_HEADER = "Idempotent-Replayed";
+    private static final String KEY_DESCRIPTION =
+            "Unique key per logical operation (e.g. a UUID). Retrying with the same key and payload "
+                    + "returns the original result without moving money again.";
+
+    private final TransactionService transactionService;
+    private final TransactionQueryService queryService;
+
+    @PostMapping("/transactions/deposits")
+    @Operation(summary = "Deposit into one of my accounts")
+    @ApiResponse(responseCode = "201", description = "Deposit executed")
+    @ApiResponse(responseCode = "200", description = "Idempotent replay of an earlier identical request",
+            headers = @Header(name = REPLAY_HEADER, description = "always 'true'"))
+    @ApiResponse(responseCode = "422", description = "Business rule violated / key reused with another payload",
+            content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public ResponseEntity<TransactionResponse> deposit(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @Parameter(description = KEY_DESCRIPTION, example = "6f1c2a52-8a4e-4f0e-9a0b-3d6c5f6a1e21")
+            @RequestHeader(IdempotencyService.HEADER) String idempotencyKey,
+            @Valid @RequestBody DepositRequest request) {
+        return toResponse(transactionService.execute(idempotencyKey,
+                TransactionCommand.deposit(principal.id(), request.accountNumber(),
+                        request.amount(), request.description())));
+    }
+
+    @PostMapping("/transactions/withdrawals")
+    @Operation(summary = "Withdraw from one of my accounts")
+    @ApiResponse(responseCode = "201", description = "Withdrawal executed")
+    @ApiResponse(responseCode = "200", description = "Idempotent replay of an earlier identical request",
+            headers = @Header(name = REPLAY_HEADER, description = "always 'true'"))
+    @ApiResponse(responseCode = "422", description = "Insufficient balance / limit exceeded / key reused",
+            content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public ResponseEntity<TransactionResponse> withdraw(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @Parameter(description = KEY_DESCRIPTION, example = "0d4a7c19-3f5b-4d58-8d52-7c1f9e2b6a10")
+            @RequestHeader(IdempotencyService.HEADER) String idempotencyKey,
+            @Valid @RequestBody WithdrawalRequest request) {
+        return toResponse(transactionService.execute(idempotencyKey,
+                TransactionCommand.withdrawal(principal.id(), request.accountNumber(),
+                        request.amount(), request.description())));
+    }
+
+    @PostMapping("/transactions/transfers")
+    @Operation(summary = "Transfer from one of my accounts to another account")
+    @ApiResponse(responseCode = "201", description = "Transfer executed")
+    @ApiResponse(responseCode = "200", description = "Idempotent replay of an earlier identical request",
+            headers = @Header(name = REPLAY_HEADER, description = "always 'true'"))
+    @ApiResponse(responseCode = "404", description = "Source (not mine) or destination account not found",
+            content = @Content(schema = @Schema(implementation = ApiError.class)))
+    @ApiResponse(responseCode = "422", description = "Insufficient balance / same account / key reused",
+            content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public ResponseEntity<TransactionResponse> transfer(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @Parameter(description = KEY_DESCRIPTION, example = "b2e8f5c0-6a1d-4c36-9f47-1a2b3c4d5e6f")
+            @RequestHeader(IdempotencyService.HEADER) String idempotencyKey,
+            @Valid @RequestBody TransferRequest request) {
+        return toResponse(transactionService.execute(idempotencyKey,
+                TransactionCommand.transfer(principal.id(), request.sourceAccountNumber(),
+                        request.destinationAccountNumber(), request.amount(), request.description())));
+    }
+
+    @GetMapping("/transactions/{referenceNo}")
+    @Operation(summary = "Get a transaction I took part in (as sender or receiver)")
+    @ApiResponse(responseCode = "404", description = "Not found or not visible to the caller",
+            content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public TransactionResponse getTransaction(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @PathVariable String referenceNo) {
+        return queryService.getByReference(principal.id(), referenceNo);
+    }
+
+    @GetMapping("/accounts/{accountNumber}/transactions")
+    @Operation(summary = "Account statement (newest first, paginated, with running balance)")
+    @ApiResponse(responseCode = "404", description = "Account not found or not owned by the caller",
+            content = @Content(schema = @Schema(implementation = ApiError.class)))
+    public PageResponse<AccountMutationResponse> statement(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal,
+            @PathVariable String accountNumber,
+            @Parameter(description = "Zero-based page index") @RequestParam(defaultValue = "0") int page,
+            @Parameter(description = "Page size, 1-100") @RequestParam(defaultValue = "20") int size) {
+        return queryService.getStatement(principal.id(), accountNumber, page, size);
+    }
+
+    private ResponseEntity<TransactionResponse> toResponse(TransactionResult result) {
+        TransactionResponse body = result.response();
+        if (result.replayed()) {
+            return ResponseEntity.ok().header(REPLAY_HEADER, "true").body(body);
+        }
+        return ResponseEntity.created(URI.create("/api/v1/transactions/" + body.referenceNo())).body(body);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionQueryService.java ===
+package tutorjava.digitalbanking.transaction;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.account.Account;
+import tutorjava.digitalbanking.account.AccountRepository;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.common.response.PageResponse;
+import tutorjava.digitalbanking.transaction.dto.AccountMutationResponse;
+import tutorjava.digitalbanking.transaction.dto.TransactionResponse;
+
+import java.util.UUID;
+
+/** Read side (CQRS-lite): read-only transactions, no locks, DTO projections. */
+@Service
+@RequiredArgsConstructor
+public class TransactionQueryService {
+
+    private static final int MAX_PAGE_SIZE = 100;
+
+    private final TransactionRepository transactionRepository;
+    private final LedgerEntryRepository ledgerEntryRepository;
+    private final AccountRepository accountRepository;
+
+    @Transactional(readOnly = true)
+    public TransactionResponse getByReference(UUID userId, String referenceNo) {
+        return transactionRepository.findVisibleToUser(referenceNo, userId)
+                .map(TransactionResponse::from)
+                .orElseThrow(() -> new BusinessException(ErrorCode.TRANSACTION_NOT_FOUND));
+    }
+
+    @Transactional(readOnly = true)
+    public PageResponse<AccountMutationResponse> getStatement(UUID userId, String accountNumber,
+                                                               int page, int size) {
+        Account account = accountRepository.findByAccountNumberAndUserId(accountNumber, userId)
+                .orElseThrow(() -> new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND));
+        // never trust paging input: clamp it so nobody can request a million rows
+        int safePage = Math.max(page, 0);
+        int safeSize = Math.min(Math.max(size, 1), MAX_PAGE_SIZE);
+        return PageResponse.from(
+                ledgerEntryRepository.findStatement(account.getId(), PageRequest.of(safePage, safeSize)));
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionRepository.java ===
+package tutorjava.digitalbanking.transaction;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.Optional;
+import java.util.UUID;
+
+public interface TransactionRepository extends JpaRepository<Transaction, UUID> {
+
+    /** A transaction is visible only to the owner of its source or destination account. */
+    @Query("""
+            select t from Transaction t
+            where t.referenceNo = :referenceNo
+              and (t.sourceAccountNumber in (select a.accountNumber from Account a where a.userId = :userId)
+                or t.destinationAccountNumber in (select a.accountNumber from Account a where a.userId = :userId))
+            """)
+    Optional<Transaction> findVisibleToUser(@Param("referenceNo") String referenceNo,
+                                            @Param("userId") UUID userId);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionResult.java ===
+package tutorjava.digitalbanking.transaction;
+
+import tutorjava.digitalbanking.transaction.dto.TransactionResponse;
+
+/** @param replayed true when the response was served from a previous request with the same Idempotency-Key */
+public record TransactionResult(TransactionResponse response, boolean replayed) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionService.java ===
+package tutorjava.digitalbanking.transaction;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.config.BankingProperties;
+import tutorjava.digitalbanking.idempotency.IdempotencyClaim;
+import tutorjava.digitalbanking.idempotency.IdempotencyService;
+import tutorjava.digitalbanking.transaction.dto.TransactionResponse;
+import tutorjava.digitalbanking.transaction.processor.TransactionProcessorRegistry;
+
+/**
+ * FACADE / orchestrator for every money movement.
+ *
+ * ONE @Transactional boundary wraps: idempotency claim -> account row locks -> balance changes ->
+ * transaction + ledger rows -> idempotency completion. Any failure rolls back ALL of it (atomicity),
+ * balances are protected by row locks (isolation) and CHECK constraints (consistency).
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class TransactionService {
+
+    private final IdempotencyService idempotencyService;
+    private final TransactionProcessorRegistry processorRegistry;
+    private final TransactionRepository transactionRepository;
+    private final BankingProperties bankingProperties;
+
+    @Transactional
+    public TransactionResult execute(String idempotencyKey, TransactionCommand command) {
+        if (command.amount().compareTo(bankingProperties.maxTransactionAmount()) > 0) {
+            throw new BusinessException(ErrorCode.AMOUNT_LIMIT_EXCEEDED);
+        }
+
+        IdempotencyClaim claim = idempotencyService.claim(command.userId(), idempotencyKey, command.fingerprint());
+
+        return switch (claim) {
+            case IdempotencyClaim.Fresh fresh -> {
+                Transaction transaction = processorRegistry.get(command.type()).process(command);
+                // idempotency_keys.transaction_id is a FK: the transaction row must physically exist
+                // (and balance updates are sent to the DB) before the bulk UPDATE below runs.
+                transactionRepository.flush();
+                idempotencyService.complete(fresh.claimId(), transaction.getId());
+                log.atInfo()
+                        .addKeyValue("referenceNo", transaction.getReferenceNo())
+                        .addKeyValue("type", transaction.getType())
+                        .addKeyValue("amount", transaction.getAmount())
+                        .addKeyValue("userId", command.userId())
+                        .log("Transaction completed");
+                yield new TransactionResult(TransactionResponse.from(transaction), false);
+            }
+            case IdempotencyClaim.Replay replay -> {
+                Transaction transaction = transactionRepository.findById(replay.transactionId())
+                        .orElseThrow(() -> new BusinessException(ErrorCode.TRANSACTION_NOT_FOUND));
+                yield new TransactionResult(TransactionResponse.from(transaction), true);
+            }
+        };
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\TransactionType.java ===
+package tutorjava.digitalbanking.transaction;
+
+public enum TransactionType {
+    DEPOSIT,
+    WITHDRAWAL,
+    TRANSFER
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\dto\AccountMutationResponse.java ===
+package tutorjava.digitalbanking.transaction.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import tutorjava.digitalbanking.transaction.EntryDirection;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+
+/** One line of an account statement. Also used as a JPQL constructor projection. */
+public record AccountMutationResponse(
+        String referenceNo,
+        TransactionType type,
+        @Schema(description = "DEBIT = money out, CREDIT = money in") EntryDirection direction,
+        BigDecimal amount,
+        @Schema(description = "Account balance right after this entry") BigDecimal balanceAfter,
+        String description,
+        Instant createdAt) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\dto\DepositRequest.java ===
+package tutorjava.digitalbanking.transaction.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
+
+public record DepositRequest(
+        @Schema(example = "1234567890", description = "One of your own accounts")
+        @NotBlank @Pattern(regexp = "^\\d{10}$", message = "must be a 10-digit account number")
+        String accountNumber,
+
+        @Schema(example = "500000.00")
+        @NotNull @DecimalMin("0.01") @Digits(integer = 15, fraction = 2)
+        BigDecimal amount,
+
+        @Schema(example = "Top up")
+        @Size(max = 140)
+        String description) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\dto\TransactionResponse.java ===
+package tutorjava.digitalbanking.transaction.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import tutorjava.digitalbanking.transaction.Transaction;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+
+public record TransactionResponse(
+        @Schema(example = "TRX20261116AB12CD34EF") String referenceNo,
+        TransactionType type,
+        BigDecimal amount,
+        @Schema(example = "IDR") String currency,
+        String sourceAccountNumber,
+        String destinationAccountNumber,
+        String description,
+        Instant createdAt) {
+
+    public static TransactionResponse from(Transaction t) {
+        return new TransactionResponse(t.getReferenceNo(), t.getType(), t.getAmount(), t.getCurrency(),
+                t.getSourceAccountNumber(), t.getDestinationAccountNumber(), t.getDescription(), t.getCreatedAt());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\dto\TransferRequest.java ===
+package tutorjava.digitalbanking.transaction.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
+
+public record TransferRequest(
+        @Schema(example = "1234567890", description = "One of your own accounts")
+        @NotBlank @Pattern(regexp = "^\\d{10}$", message = "must be a 10-digit account number")
+        String sourceAccountNumber,
+
+        @Schema(example = "9876543210", description = "Any existing account")
+        @NotBlank @Pattern(regexp = "^\\d{10}$", message = "must be a 10-digit account number")
+        String destinationAccountNumber,
+
+        @Schema(example = "250000.00")
+        @NotNull @DecimalMin("0.01") @Digits(integer = 15, fraction = 2)
+        BigDecimal amount,
+
+        @Schema(example = "Pay back lunch")
+        @Size(max = 140)
+        String description) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\dto\WithdrawalRequest.java ===
+package tutorjava.digitalbanking.transaction.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
+
+public record WithdrawalRequest(
+        @Schema(example = "1234567890", description = "One of your own accounts")
+        @NotBlank @Pattern(regexp = "^\\d{10}$", message = "must be a 10-digit account number")
+        String accountNumber,
+
+        @Schema(example = "100000.00")
+        @NotNull @DecimalMin("0.01") @Digits(integer = 15, fraction = 2)
+        BigDecimal amount,
+
+        @Schema(example = "ATM cash withdrawal")
+        @Size(max = 140)
+        String description) {
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\processor\DepositProcessor.java ===
+package tutorjava.digitalbanking.transaction.processor;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.account.Account;
+import tutorjava.digitalbanking.account.AccountLockService;
+import tutorjava.digitalbanking.transaction.Transaction;
+import tutorjava.digitalbanking.transaction.TransactionCommand;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+/** Cash-in to one of the caller's own accounts (simulates a top-up from an external channel). */
+@Component
+@RequiredArgsConstructor
+public class DepositProcessor implements TransactionProcessor {
+
+    private final AccountLockService accountLockService;
+    private final TransactionRecorder recorder;
+
+    @Override
+    public TransactionType supportedType() {
+        return TransactionType.DEPOSIT;
+    }
+
+    @Override
+    public Transaction process(TransactionCommand command) {
+        Account account = accountLockService.lockOwned(command.destinationAccountNumber(), command.userId());
+        account.credit(command.amount());
+        return recorder.record(command, null, account);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\processor\TransactionProcessor.java ===
+package tutorjava.digitalbanking.transaction.processor;
+
+import tutorjava.digitalbanking.transaction.Transaction;
+import tutorjava.digitalbanking.transaction.TransactionCommand;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+/**
+ * STRATEGY: one implementation per transaction type. Adding a new type (e.g. bill payment)
+ * means adding one class, without touching TransactionService (open/closed principle).
+ * Implementations run inside the caller's database transaction.
+ */
+public interface TransactionProcessor {
+
+    TransactionType supportedType();
+
+    Transaction process(TransactionCommand command);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\processor\TransactionProcessorRegistry.java ===
+package tutorjava.digitalbanking.transaction.processor;
+
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+
+/** FACTORY / registry: resolves the strategy for a type. Spring injects every TransactionProcessor bean. */
+@Component
+public class TransactionProcessorRegistry {
+
+    private final Map<TransactionType, TransactionProcessor> processors = new EnumMap<>(TransactionType.class);
+
+    public TransactionProcessorRegistry(List<TransactionProcessor> available) {
+        for (TransactionProcessor processor : available) {
+            TransactionProcessor previous = processors.put(processor.supportedType(), processor);
+            if (previous != null) {
+                throw new IllegalStateException("Duplicate processor for " + processor.supportedType());
+            }
+        }
+        for (TransactionType type : TransactionType.values()) {
+            if (!processors.containsKey(type)) {
+                throw new IllegalStateException("No processor registered for " + type);
+            }
+        }
+    }
+
+    public TransactionProcessor get(TransactionType type) {
+        return processors.get(type);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\processor\TransactionRecorder.java ===
+package tutorjava.digitalbanking.transaction.processor;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.account.Account;
+import tutorjava.digitalbanking.transaction.EntryDirection;
+import tutorjava.digitalbanking.transaction.LedgerEntry;
+import tutorjava.digitalbanking.transaction.LedgerEntryRepository;
+import tutorjava.digitalbanking.transaction.Transaction;
+import tutorjava.digitalbanking.transaction.TransactionCommand;
+import tutorjava.digitalbanking.transaction.TransactionRepository;
+
+import java.security.SecureRandom;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Shared persistence step of every processor: writes the transaction header and one ledger entry per
+ * affected account. Call it AFTER the account balances have been updated so balance_after is correct.
+ */
+@Component
+@RequiredArgsConstructor
+public class TransactionRecorder {
+
+    private static final String ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    private static final DateTimeFormatter DATE = DateTimeFormatter.BASIC_ISO_DATE;
+
+    private final TransactionRepository transactionRepository;
+    private final LedgerEntryRepository ledgerEntryRepository;
+    private final SecureRandom random = new SecureRandom();
+
+    /** @param source null for deposits; @param destination null for withdrawals */
+    public Transaction record(TransactionCommand command, Account source, Account destination) {
+        String currency = source != null ? source.getCurrency() : destination.getCurrency();
+
+        Transaction transaction = transactionRepository.save(Transaction.builder()
+                .referenceNo(nextReference())
+                .type(command.type())
+                .amount(command.amount())
+                .currency(currency)
+                .sourceAccountNumber(source != null ? source.getAccountNumber() : null)
+                .destinationAccountNumber(destination != null ? destination.getAccountNumber() : null)
+                .description(command.description())
+                .createdBy(command.userId())
+                .build());
+
+        List<LedgerEntry> entries = new ArrayList<>(2);
+        if (source != null) {
+            entries.add(LedgerEntry.of(transaction, source.getId(), EntryDirection.DEBIT,
+                    command.amount(), source.getBalance()));
+        }
+        if (destination != null) {
+            entries.add(LedgerEntry.of(transaction, destination.getId(), EntryDirection.CREDIT,
+                    command.amount(), destination.getBalance()));
+        }
+        ledgerEntryRepository.saveAll(entries);
+        return transaction;
+    }
+
+    private String nextReference() {
+        StringBuilder sb = new StringBuilder("TRX")
+                .append(LocalDate.now(ZoneOffset.UTC).format(DATE));
+        for (int i = 0; i < 10; i++) {
+            sb.append(ALPHABET.charAt(random.nextInt(ALPHABET.length())));
+        }
+        return sb.toString();
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\processor\TransferProcessor.java ===
+package tutorjava.digitalbanking.transaction.processor;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.account.Account;
+import tutorjava.digitalbanking.account.AccountLockService;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.transaction.Transaction;
+import tutorjava.digitalbanking.transaction.TransactionCommand;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+import java.util.Map;
+import java.util.Set;
+
+/** Moves money from one of the caller's accounts to any other account, atomically. */
+@Component
+@RequiredArgsConstructor
+public class TransferProcessor implements TransactionProcessor {
+
+    private final AccountLockService accountLockService;
+    private final TransactionRecorder recorder;
+
+    @Override
+    public TransactionType supportedType() {
+        return TransactionType.TRANSFER;
+    }
+
+    @Override
+    public Transaction process(TransactionCommand command) {
+        String sourceNumber = command.sourceAccountNumber();
+        String destinationNumber = command.destinationAccountNumber();
+        if (sourceNumber.equals(destinationNumber)) {
+            throw new BusinessException(ErrorCode.SAME_ACCOUNT_TRANSFER);
+        }
+
+        // Both rows are locked in one statement, in a deterministic order -> no deadlocks.
+        Map<String, Account> locked = accountLockService.lock(Set.of(sourceNumber, destinationNumber));
+        Account source = locked.get(sourceNumber);
+        Account destination = locked.get(destinationNumber);
+
+        if (!source.isOwnedBy(command.userId())) {
+            throw new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND);
+        }
+        if (!source.getCurrency().equals(destination.getCurrency())) {
+            throw new BusinessException(ErrorCode.CURRENCY_MISMATCH);
+        }
+
+        source.debit(command.amount());
+        destination.credit(command.amount());
+        return recorder.record(command, source, destination);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\transaction\processor\WithdrawalProcessor.java ===
+package tutorjava.digitalbanking.transaction.processor;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+import tutorjava.digitalbanking.account.Account;
+import tutorjava.digitalbanking.account.AccountLockService;
+import tutorjava.digitalbanking.transaction.Transaction;
+import tutorjava.digitalbanking.transaction.TransactionCommand;
+import tutorjava.digitalbanking.transaction.TransactionType;
+
+/** Cash-out from one of the caller's own accounts. */
+@Component
+@RequiredArgsConstructor
+public class WithdrawalProcessor implements TransactionProcessor {
+
+    private final AccountLockService accountLockService;
+    private final TransactionRecorder recorder;
+
+    @Override
+    public TransactionType supportedType() {
+        return TransactionType.WITHDRAWAL;
+    }
+
+    @Override
+    public Transaction process(TransactionCommand command) {
+        Account account = accountLockService.lockOwned(command.sourceAccountNumber(), command.userId());
+        account.debit(command.amount());
+        return recorder.record(command, account, null);
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\user\User.java ===
+package tutorjava.digitalbanking.user;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import tutorjava.digitalbanking.common.entity.AuditableEntity;
+
+import java.time.Duration;
+import java.time.Instant;
+
+@Getter
+@Entity
+@Table(name = "users")
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class User extends AuditableEntity {
+
+    @Column(name = "email", nullable = false, updatable = false, length = 254)
+    private String email;
+
+    @Column(name = "full_name", nullable = false, length = 100)
+    private String fullName;
+
+    @Column(name = "password_hash", nullable = false, length = 100)
+    private String passwordHash;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "role", nullable = false, length = 20)
+    private UserRole role;
+
+    @Column(name = "enabled", nullable = false)
+    private boolean enabled;
+
+    @Column(name = "failed_login_attempts", nullable = false)
+    private int failedLoginAttempts;
+
+    @Column(name = "locked_until")
+    private Instant lockedUntil;
+
+    public static User register(String email, String fullName, String passwordHash) {
+        User user = new User();
+        user.email = email;
+        user.fullName = fullName;
+        user.passwordHash = passwordHash;
+        user.role = UserRole.USER;
+        user.enabled = true;
+        return user;
+    }
+
+    public boolean isLocked(Instant now) {
+        return lockedUntil != null && lockedUntil.isAfter(now);
+    }
+
+    public void registerFailedLogin(int maxAttempts, Duration lockDuration, Instant now) {
+        failedLoginAttempts++;
+        if (failedLoginAttempts >= maxAttempts) {
+            lockedUntil = now.plus(lockDuration);
+            failedLoginAttempts = 0;
+        }
+    }
+
+    public boolean hasLoginFailureState() {
+        return failedLoginAttempts > 0 || lockedUntil != null;
+    }
+
+    public void resetLoginFailures() {
+        failedLoginAttempts = 0;
+        lockedUntil = null;
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\user\UserController.java ===
+package tutorjava.digitalbanking.user;
+
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import tutorjava.digitalbanking.config.OpenApiConfig;
+import tutorjava.digitalbanking.security.AuthenticatedUser;
+import tutorjava.digitalbanking.user.dto.UserResponse;
+
+@RestController
+@RequestMapping("/api/v1/users")
+@RequiredArgsConstructor
+@Tag(name = "Users")
+@SecurityRequirement(name = OpenApiConfig.BEARER_SCHEME)
+public class UserController {
+
+    private final UserService userService;
+
+    @GetMapping("/me")
+    @Operation(summary = "Get the profile of the authenticated user")
+    public UserResponse me(@Parameter(hidden = true) @AuthenticationPrincipal AuthenticatedUser principal) {
+        return userService.getProfile(principal.id());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\user\UserRepository.java ===
+package tutorjava.digitalbanking.user;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+import java.util.UUID;
+
+public interface UserRepository extends JpaRepository<User, UUID> {
+
+    Optional<User> findByEmail(String email);
+
+    boolean existsByEmail(String email);
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\user\UserRole.java ===
+package tutorjava.digitalbanking.user;
+
+public enum UserRole {
+    USER,
+    ADMIN
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\user\UserService.java ===
+package tutorjava.digitalbanking.user;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import tutorjava.digitalbanking.common.exception.BusinessException;
+import tutorjava.digitalbanking.common.exception.ErrorCode;
+import tutorjava.digitalbanking.user.dto.UserResponse;
+
+import java.util.UUID;
+
+@Service
+@RequiredArgsConstructor
+public class UserService {
+
+    private final UserRepository userRepository;
+
+    @Transactional(readOnly = true)
+    public UserResponse getProfile(UUID userId) {
+        // The token is valid but the user may have been removed: treat as
+        // unauthenticated.
+        return userRepository.findById(userId)
+                .map(UserResponse::from)
+                .orElseThrow(() -> new BusinessException(ErrorCode.UNAUTHORIZED));
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\java\tutorjava\digitalbanking\user\dto\UserResponse.java ===
+package tutorjava.digitalbanking.user.dto;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import tutorjava.digitalbanking.user.User;
+import tutorjava.digitalbanking.user.UserRole;
+
+import java.time.Instant;
+import java.util.UUID;
+
+public record UserResponse(
+        UUID id,
+        @Schema(example = "budi@example.com") String email,
+        @Schema(example = "Budi Santoso") String fullName,
+        UserRole role,
+        Instant createdAt) {
+
+    public static UserResponse from(User user) {
+        return new UserResponse(user.getId(), user.getEmail(), user.getFullName(),
+                user.getRole(), user.getCreatedAt());
+    }
+}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\resources\application.yml ===
+spring:
+  application:
+    name: digital-banking
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  config:
+    import: optional:file:.env[.properties]
+    
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: banking-pool
+      maximum-pool-size: 5          # Neon free tier has limited connections
+      minimum-idle: 0               # Neon scales compute to zero when idle
+      idle-timeout: 60000
+      max-lifetime: 300000
+      connection-timeout: 30000
+      initialization-fail-timeout: 60000   # tolerate Neon cold start on boot
+
+  jpa:
+    open-in-view: false             # no lazy loading from the web layer
+    hibernate:
+      ddl-auto: validate            # schema is owned by Flyway migrations
+    properties:
+      hibernate:
+        jdbc:
+          "[time_zone]": UTC
+        "[default_batch_fetch_size]": 16
+
+  flyway:
+    enabled: true
+    # Optional separate (direct) connection for migrations. Defaults to the main datasource.
+    url: ${DB_MIGRATION_URL:${DB_URL}}
+    user: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+
+server:
+  port: ${PORT:3500}
+  shutdown: graceful
+    
+
+# Structured (JSON/ECS) logging is built into Spring Boot. MDC + key/values are emitted automatically.
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    root: INFO
+    "[tutorjava.digitalbanking]": INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:true}
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:true}
+    path: /swagger-ui.html
+    operations-sorter: method
+    tags-sorter: alpha
+    persist-authorization: true
+
+app:
+  jwt:
+    secret: ${JWT_SECRET}                 # base64, >= 32 bytes
+    issuer: digital-banking-api
+    access-token-expiration: 15m
+  refresh-token:
+    ttl: 7d                      # sliding: renewed on every refresh
+    absolute-ttl: 30d            # hard cap per login session
+    cookie-name: refresh_token
+    cookie-path: /api/v1/auth    # cookie is only sent to the auth endpoints
+    cookie-secure: ${REFRESH_COOKIE_SECURE:true}          # false only for plain-http local dev (e.g. Safari)
+    cookie-same-site: ${REFRESH_COOKIE_SAMESITE:Strict}   # None if the web frontend is on another site (needs secure=true)
+  auth:
+    max-failed-login-attempts: 5
+    lock-duration: 15m
+  banking:
+    currency: IDR
+    max-transaction-amount: 50000000.00
+    max-accounts-per-user: 5
+  idempotency:
+    ttl: 24h
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\resources\db\migration\V1__init_schema.sql ===
+-- =====================================================================
+-- Digital Banking - initial schema
+-- Principles: money as NUMERIC(19,2), CHECK constraints as the last line
+-- of defence, append-only ledger, UUIDv7 primary keys generated by app.
+-- =====================================================================
+
+CREATE TABLE users (
+    id                    UUID         PRIMARY KEY,
+    email                 VARCHAR(254) NOT NULL,
+    full_name             VARCHAR(100) NOT NULL,
+    password_hash         VARCHAR(100) NOT NULL,
+    role                  VARCHAR(20)  NOT NULL,
+    enabled               BOOLEAN      NOT NULL DEFAULT TRUE,
+    failed_login_attempts INTEGER      NOT NULL DEFAULT 0,
+    locked_until          TIMESTAMPTZ,
+    created_at            TIMESTAMPTZ  NOT NULL,
+    updated_at            TIMESTAMPTZ  NOT NULL,
+    version               BIGINT       NOT NULL DEFAULT 0,
+    CONSTRAINT uq_users_email           UNIQUE (email),
+    CONSTRAINT ck_users_email_lowercase CHECK (email = lower(email)),
+    CONSTRAINT ck_users_role            CHECK (role IN ('USER', 'ADMIN')),
+    CONSTRAINT ck_users_failed_attempts CHECK (failed_login_attempts >= 0)
+);
+
+CREATE TABLE accounts (
+    id             UUID           PRIMARY KEY,
+    account_number VARCHAR(10)    NOT NULL,
+    user_id        UUID           NOT NULL REFERENCES users (id),
+    account_name   VARCHAR(50)    NOT NULL,
+    currency       VARCHAR(3)     NOT NULL,
+    balance        NUMERIC(19, 2) NOT NULL DEFAULT 0,
+    status         VARCHAR(20)    NOT NULL,
+    created_at     TIMESTAMPTZ    NOT NULL,
+    updated_at     TIMESTAMPTZ    NOT NULL,
+    version        BIGINT         NOT NULL DEFAULT 0,
+    CONSTRAINT uq_accounts_number  UNIQUE (account_number),
+    CONSTRAINT ck_accounts_balance CHECK (balance >= 0),
+    CONSTRAINT ck_accounts_status  CHECK (status IN ('ACTIVE', 'FROZEN', 'CLOSED'))
+);
+
+-- "my accounts" listing
+CREATE INDEX idx_accounts_user_created ON accounts (user_id, created_at DESC);
+
+CREATE TABLE transactions (
+    id                         UUID           PRIMARY KEY,
+    reference_no               VARCHAR(30)    NOT NULL,
+    type                       VARCHAR(20)    NOT NULL,
+    amount                     NUMERIC(19, 2) NOT NULL,
+    currency                   VARCHAR(3)     NOT NULL,
+    source_account_number      VARCHAR(10)    REFERENCES accounts (account_number),
+    destination_account_number VARCHAR(10)    REFERENCES accounts (account_number),
+    description                VARCHAR(140),
+    created_by                 UUID           NOT NULL REFERENCES users (id),
+    created_at                 TIMESTAMPTZ    NOT NULL,
+    CONSTRAINT uq_transactions_reference UNIQUE (reference_no),
+    CONSTRAINT ck_transactions_amount    CHECK (amount > 0),
+    CONSTRAINT ck_transactions_shape CHECK (
+        (type = 'DEPOSIT'    AND source_account_number IS NULL     AND destination_account_number IS NOT NULL)
+     OR (type = 'WITHDRAWAL' AND source_account_number IS NOT NULL AND destination_account_number IS NULL)
+     OR (type = 'TRANSFER'   AND source_account_number IS NOT NULL AND destination_account_number IS NOT NULL
+                             AND source_account_number <> destination_account_number)
+    )
+);
+
+-- Double-entry style ledger: one row per account affected by a transaction.
+-- Account statements are served from this table using a single index.
+CREATE TABLE ledger_entries (
+    id             UUID           PRIMARY KEY,
+    transaction_id UUID           NOT NULL REFERENCES transactions (id),
+    account_id     UUID           NOT NULL REFERENCES accounts (id),
+    direction      VARCHAR(10)    NOT NULL,
+    amount         NUMERIC(19, 2) NOT NULL,
+    balance_after  NUMERIC(19, 2) NOT NULL,
+    created_at     TIMESTAMPTZ    NOT NULL,
+    CONSTRAINT ck_ledger_direction     CHECK (direction IN ('DEBIT', 'CREDIT')),
+    CONSTRAINT ck_ledger_amount        CHECK (amount > 0),
+    CONSTRAINT ck_ledger_balance_after CHECK (balance_after >= 0)
+);
+
+CREATE INDEX idx_ledger_account_created ON ledger_entries (account_id, created_at DESC, id DESC);
+CREATE INDEX idx_ledger_transaction     ON ledger_entries (transaction_id);
+
+CREATE TABLE idempotency_keys (
+    id              UUID         PRIMARY KEY,
+    user_id         UUID         NOT NULL REFERENCES users (id),
+    idempotency_key VARCHAR(100) NOT NULL,
+    request_hash    VARCHAR(64)  NOT NULL,
+    transaction_id  UUID         REFERENCES transactions (id),
+    created_at      TIMESTAMPTZ  NOT NULL,
+    expires_at      TIMESTAMPTZ  NOT NULL,
+    CONSTRAINT uq_idempotency_user_key UNIQUE (user_id, idempotency_key)
+);
+
+CREATE INDEX idx_idempotency_expires_at ON idempotency_keys (expires_at);
+
+-- Financial records are append-only: block UPDATE / DELETE at the database level.
+CREATE FUNCTION forbid_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION '% on % is not allowed (append-only table)', TG_OP, TG_TABLE_NAME;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_transactions_append_only
+    BEFORE UPDATE OR DELETE ON transactions
+    FOR EACH ROW EXECUTE FUNCTION forbid_mutation();
+
+CREATE TRIGGER trg_ledger_entries_append_only
+    BEFORE UPDATE OR DELETE ON ledger_entries
+    FOR EACH ROW EXECUTE FUNCTION forbid_mutation();
+
+=== C:\Users\afdhali\Documents\my-projects\digital-banking\src\main\resources\db\migration\V2__refresh_tokens.sql ===
+-- Refresh tokens are opaque random strings. Only their SHA-256 hash is stored, so a database
+-- leak does not leak usable tokens. Tokens belong to a "family" (= one login session): every refresh
+-- rotates the token inside the same family, and replaying an already-used token revokes the family.
+CREATE TABLE refresh_tokens (
+    id                 UUID        PRIMARY KEY,
+    user_id            UUID        NOT NULL REFERENCES users (id),
+    family_id          UUID        NOT NULL,
+    token_hash         VARCHAR(64) NOT NULL,
+    session_started_at TIMESTAMPTZ NOT NULL,
+    expires_at         TIMESTAMPTZ NOT NULL,
+    revoked_at         TIMESTAMPTZ,
+    created_at         TIMESTAMPTZ NOT NULL,
+    CONSTRAINT uq_refresh_tokens_hash UNIQUE (token_hash)
+);
+
+CREATE INDEX idx_refresh_tokens_family  ON refresh_tokens (family_id);
+CREATE INDEX idx_refresh_tokens_user    ON refresh_tokens (user_id);
+CREATE INDEX idx_refresh_tokens_expires ON refresh_tokens (expires_at);
